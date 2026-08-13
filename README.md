@@ -41,17 +41,22 @@ CNN 原版指數用 7 個訊號（動能、強度、廣度、Put/Call、避險�
 | 1 | 動能 Momentum | 加權指數（TAIEX）收盤 vs 125 日均線乖離率 | `taiex_total_index:收盤指數` | 乖離率越正越貪婪 |
 | 2 | 強度 Stock Strength | 創 52 週新高家數 vs 新低家數（淨值） | `price:收盤價`（全市場逐股矩陣，本地算 rolling 52週高低） | 淨新高越多越貪婪 |
 | 3 | 廣度 Market Breadth | 上漲家數/成交量 vs 下跌家數/成交量（累積） | `price:收盤價` + `price:成交股數` | 廣度越強越貪婪 |
-| 4 | 選擇權 Put/Call Ratio | 台指選擇權（TXO）Put 量 / Call 量 | FinLab 無選擇權資料集，暫缺（見下方說明） | 比率越高越恐慌（反向） |
+| 4 | 選擇權 Put/Call Ratio | 台指選擇權（TXO）Put 量 / Call 量 | FinLab 無此資料，改用 **FinMind** `TaiwanOptionDaily`（見下方說明） | 比率越高越恐慌（反向） |
 | 5 | 波動度 Volatility | TAIEX 已實現波動率（20日年化）相對 50 日均值偏離 | `taiex_total_index:收盤指數`（自算已實現波動率，取代隱含波動率 VIX） | 波動越高越恐慌（反向） |
 | 6 | 避險需求 Safe Haven Demand | 台股 20 日報酬 − 債券 ETF 20 日報酬 | `price:收盤價`（如 `00679B` 等已上市債券 ETF） | 股優於債越多越貪婪 |
 | 7 | 融資動能 Margin Sentiment | 融資餘額 20 日變化率（散戶槓桿多單） | `margin_balance:融資券總餘額`（全市場合計） | 融資暴增越貪婪、急縮越恐慌 |
 | 8 | 外資部位 Foreign Positioning | 外資現貨 20 日累計買賣超股數 + 台指期未平倉多空淨口數 | `institutional_investors_trading_summary:外陸資買賣超股數(不含外資自營商)` + `futures_institutional_investors_trading_summary:多空未平倉口數淨額` | 買超/偏多越多越貪婪 |
 
-> **Put/Call 指標的缺口**：FinLab 是以個股基本面/技術面資料為主的平台，沒有 TAIFEX 選擇權成交量或
-> 台指選擇權波動率指數（VIX）資料集。目前設計是直接省略這個子指標（`compute_all_raw_indicators`
-> 會自動跳過缺資料的來源），權重由其餘 7 項按比例重新分配，不會用 0 分頂替。若之後想補上，
-> 仍可用 `data_sources.py` 裡對接的 TAIFEX OpenAPI 端點（`OptVixIndex` / `DailyMarketReportOpt`）
-> 作為第二資料源，兩邊資料合併後再丟進同一套 `scoring.py` 邏輯即可。
+> **Put/Call 指標的缺口，已用 FinMind 補上**：FinLab 是以個股基本面/技術面資料為主的平台，沒有
+> 選擇權成交量資料集。`data_sources_finmind.py` 對接 [FinMind](https://github.com/FinMind/FinMind)
+> 的 `TaiwanOptionDaily` 資料集，取台指選擇權（TXO）逐日 Put/Call 成交量。若完全不接 FinMind，
+> `compute_all_raw_indicators` 仍會自動跳過這個子指標、權重由其餘 7 項按比例重新分配，不會補 0 分。
+> 台指選擇權波動率指數（VIX，隱含波動率）目前仍無資料源，用 TAIEX 已實現波動率代替（見上表第 5 項）；
+> 若之後想接真正的 VIX，可用 `data_sources.py` 裡的 TAIFEX OpenAPI 端點 `OptVixIndex`。
+>
+> **⚠️ Token 不能共用**：FinMind 的 API token 是它自己獨立的帳號系統核發的，**跟 FinLab 的 API Key
+> 不是同一組**，不能拿 FinLab 的 key 去打 FinMind API。去 FinMind 自己的網站/GitHub 註冊拿 token，
+> 設成 `FINMIND_API_TOKEN` 環境變數（一樣別寫進程式碼或提交進 git）。
 
 ### 正規化方法（每個子指標都轉成 0–100）
 
@@ -111,11 +116,13 @@ src/twn_fear_greed/
   indicators.py              # 由原始價量/籌碼資料 DataFrame 計算子指標原始值（缺資料的來源會自動略過）
   data_sources.py            # 對接 TWSE / TAIFEX 開放資料 API 的抓取函式（備用/選擇權資料源）
   data_sources_finlab.py     # 對接 FinLab（https://finlab.finance/）的抓取函式（主要資料源，需網路+API Key）
+  data_sources_finmind.py    # 對接 FinMind 的抓取函式（補 Put/Call 選擇權資料，需網路+獨立 Token）
   index.py                   # TWNFearGreedIndex：組裝以上三者，輸出最終指數與歷史序列
 examples/
   run_example.py             # 用合成資料跑通整條 pipeline（不需網路，可離線驗證邏輯）
 tests/
-  test_scoring.py            # 正規化與合成邏輯的單元測試
+  test_scoring.py                  # 正規化與合成邏輯的單元測試
+  test_data_sources_finmind.py     # Put/Call 聚合邏輯的單元測試（純函式，不需網路）
 ```
 
 ## 安裝與使用
@@ -144,6 +151,27 @@ raw = fetch_all_raw_data(start="2022-01-01")
 idx = TWNFearGreedIndex()
 result = idx.compute(raw)
 print(result[["composite", "label", "overheat_flag", "oversold_flag"]].tail())
+```
+
+### 加上 FinMind，補 Put/Call 選擇權資料
+
+```bash
+export FINLAB_API_KEY="你的 FinLab API Key"
+export FINMIND_API_TOKEN="你的 FinMind Token（跟 FinLab key 不同一組，見上方警告）"
+```
+
+```python
+from twn_fear_greed.data_sources_finlab import login, fetch_all_raw_data
+from twn_fear_greed.data_sources_finmind import augment_with_options
+from twn_fear_greed.index import TWNFearGreedIndex
+
+login()
+raw = fetch_all_raw_data(start="2022-01-01")
+raw = augment_with_options(raw, start="2022-01-01")  # 補上 put_call 子指標
+
+idx = TWNFearGreedIndex()
+result = idx.compute(raw)
+print(result[["composite", "label", "put_call_score"]].tail())
 ```
 
 FinLab 是全市場逐股歷史資料（不只是單日快照），所以「52週新高新低家數」「漲跌家數/量能廣度」
