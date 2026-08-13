@@ -36,16 +36,22 @@ CNN 原版指數用 7 個訊號（動能、強度、廣度、Put/Call、避險�
 
 ## 八大子指標
 
-| # | 子指標 | 對應資料 | 資料來源（台灣） | 方向 |
+| # | 子指標 | 對應資料 | FinLab 資料集 | 方向 |
 |---|---|---|---|---|
-| 1 | 動能 Momentum | 加權指數（TAIEX）收盤 vs 125 日均線乖離率 | TWSE 每日收盤行情 | 乖離率越正越貪婪 |
-| 2 | 強度 Stock Strength | 創 52 週新高家數 vs 新低家數（淨值） | TWSE 個股日成交資訊 | 淨新高越多越貪婪 |
-| 3 | 廣度 Market Breadth | 上漲家數/成交量 vs 下跌家數/成交量（累積） | TWSE 每日市場成交彙總 | 廣度越強越貪婪 |
-| 4 | 選擇權 Put/Call Ratio | 台指選擇權（TXO）Put 量 / Call 量 | TAIFEX 選擇權每日交易資訊 | 比率越高越恐慌（反向） |
-| 5 | 波動度 Volatility | 台指選擇權波動率指數（TAIEX VIX）相對 50 日均值偏離 | TAIFEX / 期交所 VIX 指數 | VIX 越高越恐慌（反向） |
-| 6 | 避險需求 Safe Haven Demand | 台股 20 日報酬 − 公債/貨幣市場基金 20 日報酬 | TWSE 指數 + 債券指數 | 股優於債越多越貪婪 |
-| 7 | 融資動能 Margin Sentiment | 融資餘額 20 日變化率（散戶槓桿多單） | TWSE 信用交易統計 | 融資暴增越貪婪、急縮越恐慌 |
-| 8 | 外資部位 Foreign Positioning | 外資現貨 20 日累計買賣超金額 + 台指期未平倉多空比 | TWSE 三大法人買賣超 + TAIFEX 期貨未平倉 | 買超/偏多越多越貪婪 |
+| 1 | 動能 Momentum | 加權指數（TAIEX）收盤 vs 125 日均線乖離率 | `taiex_total_index:收盤指數` | 乖離率越正越貪婪 |
+| 2 | 強度 Stock Strength | 創 52 週新高家數 vs 新低家數（淨值） | `price:收盤價`（全市場逐股矩陣，本地算 rolling 52週高低） | 淨新高越多越貪婪 |
+| 3 | 廣度 Market Breadth | 上漲家數/成交量 vs 下跌家數/成交量（累積） | `price:收盤價` + `price:成交股數` | 廣度越強越貪婪 |
+| 4 | 選擇權 Put/Call Ratio | 台指選擇權（TXO）Put 量 / Call 量 | FinLab 無選擇權資料集，暫缺（見下方說明） | 比率越高越恐慌（反向） |
+| 5 | 波動度 Volatility | TAIEX 已實現波動率（20日年化）相對 50 日均值偏離 | `taiex_total_index:收盤指數`（自算已實現波動率，取代隱含波動率 VIX） | 波動越高越恐慌（反向） |
+| 6 | 避險需求 Safe Haven Demand | 台股 20 日報酬 − 債券 ETF 20 日報酬 | `price:收盤價`（如 `00679B` 等已上市債券 ETF） | 股優於債越多越貪婪 |
+| 7 | 融資動能 Margin Sentiment | 融資餘額 20 日變化率（散戶槓桿多單） | `margin_balance:融資券總餘額`（全市場合計） | 融資暴增越貪婪、急縮越恐慌 |
+| 8 | 外資部位 Foreign Positioning | 外資現貨 20 日累計買賣超股數 + 台指期未平倉多空淨口數 | `institutional_investors_trading_summary:外陸資買賣超股數(不含外資自營商)` + `futures_institutional_investors_trading_summary:多空未平倉口數淨額` | 買超/偏多越多越貪婪 |
+
+> **Put/Call 指標的缺口**：FinLab 是以個股基本面/技術面資料為主的平台，沒有 TAIFEX 選擇權成交量或
+> 台指選擇權波動率指數（VIX）資料集。目前設計是直接省略這個子指標（`compute_all_raw_indicators`
+> 會自動跳過缺資料的來源），權重由其餘 7 項按比例重新分配，不會用 0 分頂替。若之後想補上，
+> 仍可用 `data_sources.py` 裡對接的 TAIFEX OpenAPI 端點（`OptVixIndex` / `DailyMarketReportOpt`）
+> 作為第二資料源，兩邊資料合併後再丟進同一套 `scoring.py` 邏輯即可。
 
 ### 正規化方法（每個子指標都轉成 0–100）
 
@@ -101,14 +107,15 @@ composite = Σ(weight_i × score_i)
 
 ```
 src/twn_fear_greed/
-  scoring.py      # 百分位正規化、加權合成、極端旗標邏輯（純函式，無網路依賴）
-  indicators.py   # 由原始價量/籌碼資料 DataFrame 計算 8 個子指標原始值
-  data_sources.py # 對接 TWSE / TAIFEX 開放資料 API 的抓取函式（需要網路）
-  index.py        # TWNFearGreedIndex：組裝以上三者，輸出最終指數與歷史序列
+  scoring.py                # 百分位正規化、加權合成、極端旗標邏輯（純函式，無網路依賴）
+  indicators.py              # 由原始價量/籌碼資料 DataFrame 計算子指標原始值（缺資料的來源會自動略過）
+  data_sources.py            # 對接 TWSE / TAIFEX 開放資料 API 的抓取函式（備用/選擇權資料源）
+  data_sources_finlab.py     # 對接 FinLab（https://finlab.finance/）的抓取函式（主要資料源，需網路+API Key）
+  index.py                   # TWNFearGreedIndex：組裝以上三者，輸出最終指數與歷史序列
 examples/
-  run_example.py  # 用合成資料跑通整條 pipeline（不需網路，可離線驗證邏輯）
+  run_example.py             # 用合成資料跑通整條 pipeline（不需網路，可離線驗證邏輯）
 tests/
-  test_scoring.py # 正規化與合成邏輯的單元測試
+  test_scoring.py            # 正規化與合成邏輯的單元測試
 ```
 
 ## 安裝與使用
@@ -116,27 +123,43 @@ tests/
 ```bash
 pip install -r requirements.txt
 
-# 離線示範（合成資料，驗證邏輯）
+# 離線示範（合成資料，驗證邏輯，不需網路/API Key）
 python examples/run_example.py
+```
 
-# 正式使用（需網路，抓 TWSE/TAIFEX 開放資料）
-python -c "
-from twn_fear_greed.data_sources import fetch_all_raw_data
+### 用 FinLab 資料源正式運行
+
+**API Key 不要寫進程式碼或提交進 git**，一律用環境變數帶入：
+
+```bash
+export FINLAB_API_KEY="你的 FinLab API Key"
+```
+
+```python
+from twn_fear_greed.data_sources_finlab import login, fetch_all_raw_data
 from twn_fear_greed.index import TWNFearGreedIndex
 
-raw = fetch_all_raw_data(start='2023-01-01')
+login()  # 自動讀取 FINLAB_API_KEY 環境變數
+raw = fetch_all_raw_data(start="2022-01-01")
 idx = TWNFearGreedIndex()
 result = idx.compute(raw)
-print(result.tail())
-"
+print(result[["composite", "label", "overheat_flag", "oversold_flag"]].tail())
 ```
+
+FinLab 是全市場逐股歷史資料（不只是單日快照），所以「52週新高新低家數」「漲跌家數/量能廣度」
+這兩項在純 TWSE OpenAPI 版本原本因為缺歷史資料而無法計算，改用 FinLab 後可以直接算。
+但 FinLab 沒有選擇權/VIX 資料集，Put/Call 子指標會被自動略過（其餘 7 項權重按比例重新分配），
+波動度子指標則改用 TAIEX 已實現波動率（20日年化）取代隱含波動率 VIX，詳見上方子指標表格。
 
 ## 資料來源備註
 
-`data_sources.py` 對接以下公開資料（皆為台灣主管機關/交易所開放資料，免費、免申請 API Key）：
+- **主要**：`data_sources_finlab.py` 對接 [FinLab](https://finlab.finance/)（付費訂閱制資料平台，
+  需要 API Key，但提供乾淨的全市場歷史矩陣，不用自己維護逐股歷史）。
+- **備用/選擇權資料**：`data_sources.py` 對接 TWSE / 期交所開放資料（免費、免 API Key，但個股類
+  端點只回傳單日快照，52週新高新低/廣度需自行持續累積歷史）：
+  - 證交所 OpenAPI：<https://openapi.twse.com.tw/>
+  - 期交所 OpenAPI：<https://openapi.taifex.com.tw/>（唯一有台指選擇權 Put/Call 與 VIX 的來源）
 
-- 證交所 OpenAPI：<https://openapi.twse.com.tw/>（每日收盤行情、個股漲跌停/新高新低、三大法人買賣超、信用交易融資融券餘額）
-- 期交所 OpenAPI：<https://openapi.taifex.com.tw/>（台指選擇權 Put/Call 成交量、台指選擇權波動率指數、期貨三大法人未平倉）
-
-實際欄位名稱與端點路徑會隨交易所改版調整，`data_sources.py` 內已用常數集中管理端點，
-若失效只需更新對應 URL/欄位對照即可，不影響 `scoring.py` / `indicators.py` 的核心邏輯。
+兩個資料源回傳的 DataFrame 欄位是刻意對齊的（見 `indicators.py` 檔頭的 schema 說明），
+所以可以混用：例如用 FinLab 取 6 項核心指標，再用 TAIFEX OpenAPI 補上 Put/Call，
+兩份 dict 用 `{**finlab_raw, **taifex_options_raw}` 合併即可丟進同一個 `TWNFearGreedIndex`。

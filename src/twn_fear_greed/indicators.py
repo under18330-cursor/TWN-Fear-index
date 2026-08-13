@@ -92,15 +92,31 @@ def foreign_positioning(foreign: pd.DataFrame, cumulative_window: int = 20) -> p
 
 
 def compute_all_raw_indicators(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Run every indicator function against a raw-data bundle and align on date."""
-    series = {
-        "momentum": momentum(raw["index_price"]),
-        "strength": strength(raw["new_high_low"]),
-        "breadth": breadth(raw["breadth"]),
-        "put_call": put_call_ratio(raw["options"]),
-        "volatility": volatility(raw["vix"]),
-        "safe_haven": safe_haven_demand(raw["index_price"], raw["bond_index"]),
-        "margin": margin_sentiment(raw["margin"]),
-        "foreign": foreign_positioning(raw["foreign"]),
+    """Run every indicator function against a raw-data bundle and align on date.
+
+    Sources are optional: a source your data provider doesn't offer (e.g.
+    FinLab has no options/VIX/bond dataset) can simply be omitted from
+    `raw`, and that indicator is skipped rather than raising. Downstream,
+    `scoring.composite_score` renormalizes weights over whatever
+    indicators actually produced a score, so missing sources don't bias
+    the composite toward "neutral" -- they're excluded, not zeroed.
+    """
+    builders = {
+        "momentum": lambda: momentum(raw["index_price"]),
+        "strength": lambda: strength(raw["new_high_low"]),
+        "breadth": lambda: breadth(raw["breadth"]),
+        "put_call": lambda: put_call_ratio(raw["options"]),
+        "volatility": lambda: volatility(raw["vix"]),
+        "safe_haven": lambda: safe_haven_demand(raw["index_price"], raw["bond_index"]),
+        "margin": lambda: margin_sentiment(raw["margin"]),
+        "foreign": lambda: foreign_positioning(raw["foreign"]),
     }
+    series = {}
+    for name, build in builders.items():
+        try:
+            series[name] = build()
+        except KeyError:
+            continue
+    if not series:
+        raise ValueError("raw data bundle did not contain any known indicator sources")
     return pd.concat(series.values(), axis=1)
