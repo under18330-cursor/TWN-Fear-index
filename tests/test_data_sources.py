@@ -189,6 +189,83 @@ def test_last_probable_trading_day_leaves_a_weekday_alone():
     assert ds._last_probable_trading_day(monday) == monday
 
 
+MI_INDEX_FIELDS = [
+    "證券代號", "證券名稱", "成交股數", "成交筆數", "成交金額",
+    "開盤價", "最高價", "最低價", "收盤價", "漲跌(+/-)", "漲跌價差",
+    "最後揭示買價", "最後揭示買量", "最後揭示賣價", "最後揭示賣量", "本益比",
+]
+
+
+def _mi_index_row(code, close, volume, direction):
+    tag = {"up": "<p style= color:red>+</p>", "down": "<p style= color:green>-</p>", "flat": "<p> </p>"}[direction]
+    return [code, "名稱", volume, "10", "0", close, close, close, close, tag, "0", "", "", "", "", ""]
+
+
+def _mi_index_payload(rows):
+    return {"stat": "OK", "date": "20260803", "tables": [{"fields": MI_INDEX_FIELDS, "data": rows}]}
+
+
+def test_market_snapshot_from_mi_index_keeps_only_common_stock_codes():
+    rows = [
+        _mi_index_row("2330", "500.0", "1000", "up"),
+        _mi_index_row("0050", "150.0", "2000", "down"),      # ETF -- excluded
+        _mi_index_row("00679B", "16.0", "3000", "up"),        # bond ETF -- excluded
+        _mi_index_row("020000", "10.0", "500", "up"),         # warrant -- excluded
+    ]
+    result = ds._market_snapshot_from_mi_index(_mi_index_payload(rows))
+    assert list(result.index) == ["2330"]
+    assert result.loc["2330", "close"] == 500.0
+    assert result.loc["2330", "volume"] == 1000
+    assert result.loc["2330", "is_up"] and not result.loc["2330", "is_down"]
+
+
+def test_market_snapshot_from_mi_index_flat_day_is_neither_up_nor_down():
+    rows = [_mi_index_row("2330", "500.0", "1000", "flat")]
+    result = ds._market_snapshot_from_mi_index(_mi_index_payload(rows))
+    assert not result.loc["2330", "is_up"]
+    assert not result.loc["2330", "is_down"]
+
+
+def test_market_snapshot_from_mi_index_no_matching_table_is_empty():
+    result = ds._market_snapshot_from_mi_index({"stat": "OK", "tables": [{"fields": ["x"], "data": [[1]]}]})
+    assert result.empty
+    assert list(result.columns) == ["close", "volume", "is_up", "is_down"]
+
+
+def test_aggregate_breadth_sums_volume_by_direction():
+    snapshots = {
+        pd.Timestamp("2026-08-03"): pd.DataFrame(
+            {"close": [100.0, 50.0], "volume": [10.0, 20.0], "is_up": [True, False], "is_down": [False, True]},
+            index=["2330", "2317"],
+        ),
+    }
+    breadth, _ = ds._aggregate_breadth_and_strength(snapshots, new_high_low_window=252)
+    assert breadth.loc[pd.Timestamp("2026-08-03"), "advancing_volume"] == 10.0
+    assert breadth.loc[pd.Timestamp("2026-08-03"), "declining_volume"] == 20.0
+
+
+def test_aggregate_strength_flags_new_high_after_full_window():
+    dates = pd.bdate_range("2026-01-01", periods=5)
+    # stock climbs steadily -> every day after the (short, window=3) lookback is a new high
+    closes = [10.0, 11.0, 12.0, 13.0, 14.0]
+    snapshots = {
+        d: pd.DataFrame({"close": [c], "volume": [1.0], "is_up": [True], "is_down": [False]}, index=["2330"])
+        for d, c in zip(dates, closes)
+    }
+    _, new_high_low = ds._aggregate_breadth_and_strength(snapshots, new_high_low_window=3)
+    assert pd.isna(new_high_low.loc[dates[0], "new_highs"])  # not enough lookback yet
+    assert pd.isna(new_high_low.loc[dates[1], "new_highs"])
+    assert new_high_low.loc[dates[2], "new_highs"] == 1  # first day with a full 3-day window
+    assert new_high_low.loc[dates[4], "new_highs"] == 1
+    assert new_high_low.loc[dates[4], "new_lows"] == 0
+
+
+def test_aggregate_breadth_and_strength_empty_input():
+    breadth, new_high_low = ds._aggregate_breadth_and_strength({})
+    assert breadth.empty and list(breadth.columns) == ["advancing_volume", "declining_volume"]
+    assert new_high_low.empty and list(new_high_low.columns) == ["new_highs", "new_lows"]
+
+
 def test_realized_volatility_is_annualized_and_positive():
     dates = pd.bdate_range("2026-07-01", periods=15)
     # alternating +1%/-1% returns -> nonzero realized vol once window fills

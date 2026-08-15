@@ -64,14 +64,23 @@ Coverage against what indicators.py needs:
                    index_price, so it covers the full history for free)
                    and lets the real data win wherever both exist.
   new_high_low,
-  breadth       -- still need locally accumulated per-symbol history (see
-                   their docstrings); no free snapshot endpoint aggregates
-                   this market-wide.
+  breadth       -- both real, full history via
+                   `fetch_market_breadth_and_strength_history` (classic
+                   MI_INDEX with type=ALLNOTIND, the same full-market
+                   bulk table behind www.twse.com.tw's "每日收盤行情" page --
+                   one request per trading day returns every listed
+                   instrument, filtered down to ordinary common stocks by
+                   code shape). No free source gives this pre-aggregated,
+                   so it's computed locally from the accumulated per-day
+                   snapshots -- new_high_low needs a real trailing
+                   252-day window before its first non-NaN value, same as
+                   any other rolling indicator.
   bond_index    -- still needs an external bond/ETF NAV series.
 """
 
 from __future__ import annotations
 
+import re
 import time
 
 import pandas as pd
@@ -90,6 +99,8 @@ ENDPOINTS = {
     "margin_balance": f"{TWSE_BASE}/exchangeReport/MI_MARGN",
     # 三大法人買賣金額統計表 (舊版網站, 當日快照, 已依身份別分行, NT$)
     "foreign_cash": f"{TWSE_CLASSIC_BASE}/fund/BFI82U",
+    # 每日收盤行情 (舊版網站, 接受 date=YYYYMMDD, 單日全市場所有證券一次回傳)
+    "market_index": f"{TWSE_CLASSIC_BASE}/afterTrading/MI_INDEX",
     # 臺指選擇權 Put/Call 比 (官方計算, 近 ~1 個月)
     "put_call_ratio": f"{TAIFEX_BASE}/PutCallRatio",
     # 三大法人-區分各期貨契約-依日期 (當日快照; 篩「臺股期貨」x「外資及陸資」)
@@ -282,6 +293,100 @@ def _foreign_cash_from_bfi82u(
     return pd.DataFrame({"net_buy_sell": [net]}, index=pd.DatetimeIndex([as_of], name="date"))
 
 
+COMMON_STOCK_CODE = re.compile(r"[1-9][0-9]{3}")  # 4 digits, not "00"-prefixed
+
+
+def _market_snapshot_from_mi_index(payload: dict) -> pd.DataFrame:
+    """MI_INDEX (classic www.twse.com.tw/rwd, type=ALLNOTIND) full-market
+    daily table -> one row per ordinary common stock.
+
+    A single day's response bundles ~31,000 rows across every instrument
+    class TWSE lists (common stocks, ETFs incl. actively-managed ones,
+    warrants, TDRs, ...); `COMMON_STOCK_CODE` keeps only the ~1,100 plain
+    4-digit codes not prefixed "00" -- ETFs/warrants/TDRs use different
+    code shapes and would otherwise swamp the real stocks ~30-to-1 in any
+    aggregate. The table itself isn't at a fixed index across days (seen
+    at index 8, but that's not guaranteed), so it's located by field
+    names instead. The direction column arrives as an HTML fragment
+    (`<p style= color:red>+</p>` for up, `color:green>-</p>` for down,
+    plain `<p>X</p>`/`<p> </p>` for halted/unchanged) rather than a plain
+    sign. Columns: close, volume, is_up, is_down (both False if flat or
+    halted). Empty if the date had no trading or the table wasn't found.
+    """
+    empty = pd.DataFrame(columns=["close", "volume", "is_up", "is_down"]).rename_axis("code")
+    target = next(
+        (t for t in (payload.get("tables") or []) if "證券代號" in (t.get("fields") or []) and "收盤價" in (t.get("fields") or [])),
+        None,
+    )
+    if target is None or not target.get("data"):
+        return empty
+
+    fields = target["fields"]
+    idx = {name: i for i, name in enumerate(fields)}
+    rows = []
+    for r in target["data"]:
+        code = r[idx["證券代號"]]
+        if not COMMON_STOCK_CODE.fullmatch(code):
+            continue
+        direction = r[idx["漲跌(+/-)"]] or ""
+        rows.append((code, r[idx["收盤價"]], r[idx["成交股數"]], "red" in direction, "green" in direction))
+    if not rows:
+        return empty
+
+    df = pd.DataFrame(rows, columns=["code", "close", "volume", "is_up", "is_down"]).set_index("code")
+    df["close"] = _num(df["close"])
+    df["volume"] = _num(df["volume"])
+    return df
+
+
+def _aggregate_breadth_and_strength(
+    daily_snapshots: dict[pd.Timestamp, pd.DataFrame], new_high_low_window: int = 252
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Turn a {date: per-stock snapshot} bundle (each snapshot shaped like
+    `_market_snapshot_from_mi_index`'s output) into the two market-wide
+    series indicators.py wants.
+
+    breadth: advancing_volume / declining_volume, a same-day aggregate --
+    just sums each stock's traded volume into the up or down bucket.
+
+    new_high_low: new_highs / new_lows, which needs history -- a stock
+    only counts as a new high on a day its close is >= its own trailing
+    `new_high_low_window`-trading-day max (analogously for lows). The
+    first `new_high_low_window - 1` days of whatever range was fetched
+    can't have this computed yet and come back NaN, same as any other
+    rolling-window indicator short on lookback -- this isn't a bug, it's
+    the real 252-day requirement biting on however much history was
+    actually pulled.
+    """
+    if not daily_snapshots:
+        empty_b = pd.DataFrame(columns=["advancing_volume", "declining_volume"]).rename_axis("date")
+        empty_h = pd.DataFrame(columns=["new_highs", "new_lows"]).rename_axis("date")
+        return empty_b, empty_h
+
+    dates = sorted(daily_snapshots)
+    breadth_rows = []
+    for d in dates:
+        snap = daily_snapshots[d]
+        adv = snap.loc[snap["is_up"], "volume"].sum()
+        dec = snap.loc[snap["is_down"], "volume"].sum()
+        breadth_rows.append((d, adv, dec))
+    breadth = pd.DataFrame(breadth_rows, columns=["date", "advancing_volume", "declining_volume"]).set_index("date")
+
+    close_matrix = pd.DataFrame({d: daily_snapshots[d]["close"] for d in dates}).T
+    close_matrix.index.name = "date"
+    rolling_max = close_matrix.rolling(window=new_high_low_window, min_periods=new_high_low_window).max()
+    rolling_min = close_matrix.rolling(window=new_high_low_window, min_periods=new_high_low_window).min()
+    is_new_high = (close_matrix >= rolling_max) & rolling_max.notna()
+    is_new_low = (close_matrix <= rolling_min) & rolling_min.notna()
+    has_lookback = rolling_max.notna().any(axis=1)
+
+    new_highs = is_new_high.sum(axis=1).where(has_lookback, other=float("nan"))
+    new_lows = is_new_low.sum(axis=1).where(has_lookback, other=float("nan"))
+    new_high_low = pd.DataFrame({"new_highs": new_highs, "new_lows": new_lows})
+
+    return breadth, new_high_low
+
+
 def realized_volatility(index_price: pd.DataFrame, window: int = 10) -> pd.DataFrame:
     """Annualized realized volatility of TAIEX daily returns.
 
@@ -387,29 +492,86 @@ def fetch_index_price_history(start: str, end: str | None = None) -> pd.DataFram
     return result.loc[start:end] if end else result.loc[start:]
 
 
-def fetch_new_high_low() -> pd.DataFrame:
-    """Placeholder aggregation: derive 52-week new-high/new-low counts from
-    daily per-stock quotes. TWSE's OpenAPI only exposes one day of
-    per-stock quotes at a time, so this requires a rolling 52-week max/min
-    computed once per symbol and then aggregated cross-sectionally per day
-    -- left as a project-specific ETL step since it depends on how much
-    per-symbol history you choose to retain locally.
+def fetch_market_breadth_and_strength_history(
+    start: str,
+    end: str | None = None,
+    new_high_low_window: int = 252,
+    chunk_size: int = 40,
+    cooldown_seconds: float = 45.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Real market breadth AND 52-week new-high/new-low counts, backed by
+    one MI_INDEX (classic www.twse.com.tw/rwd, type=ALLNOTIND) request per
+    trading day -- the full-market bulk table behind www.twse.com.tw's own
+    "每日收盤行情" page, found the same way as the other classic endpoints
+    (reading that page's data-api). Bundles both indicators because
+    they're aggregated from the same expensive per-day pull; call this
+    instead of `fetch_breadth`/`fetch_new_high_low` separately if you
+    need both, to avoid fetching ~750 days of full-market data twice.
+
+    Same rate-limit profile assumed as `fetch_foreign_cash_history` (same
+    host, same classic /rwd family, not independently reconfirmed here):
+    chunked with a cooldown between chunks, one cooldown-and-retry for a
+    single failing day before it's dropped rather than aborting the whole
+    range. A dropped day is simply absent from the accumulated series --
+    the rolling `new_high_low_window` count is over however many days
+    actually came back, not strictly that many calendar trading days.
+
+    Returns (breadth, new_high_low); see `_aggregate_breadth_and_strength`
+    for exactly what each contains and why the first stretch of
+    new_high_low is NaN (not enough trailing history yet).
     """
-    raise NotImplementedError(
-        "Aggregate 52-week new-high/new-low counts from a locally stored "
-        "per-symbol price history; TWSE's OpenAPI only exposes one day of "
-        "per-stock quotes at a time."
-    )
+    dates = pd.bdate_range(start, end or pd.Timestamp.now())
+    snapshots: dict[pd.Timestamp, pd.DataFrame] = {}
+    for i, d in enumerate(dates):
+        if i > 0 and i % chunk_size == 0:
+            time.sleep(cooldown_seconds)
+        params = {"date": d.strftime("%Y%m%d"), "type": "ALLNOTIND", "response": "json"}
+        try:
+            payload = _get_json(ENDPOINTS["market_index"], params=params)
+        except (requests.RequestException, ValueError):
+            time.sleep(cooldown_seconds)
+            try:
+                payload = _get_json(ENDPOINTS["market_index"], params=params)
+            except (requests.RequestException, ValueError):
+                continue
+        snap = _market_snapshot_from_mi_index(payload)
+        if not snap.empty:
+            snapshots[d] = snap
+        time.sleep(0.2)
+    return _aggregate_breadth_and_strength(snapshots, new_high_low_window=new_high_low_window)
 
 
-def fetch_breadth() -> pd.DataFrame:
-    """Same caveat as fetch_new_high_low: advancing/declining volume needs
-    a locally accumulated per-symbol daily history, not a single endpoint.
+def fetch_new_high_low(start: str | None = None) -> pd.DataFrame:
+    """52-week new-high/new-low counts, market-wide. Columns: new_highs,
+    new_lows.
+
+    Needs `start`: this fundamentally requires trailing per-stock price
+    history, which no free snapshot endpoint gives without actually
+    fetching that history day by day -- see
+    `fetch_market_breadth_and_strength_history` (call it directly, not
+    this function, if you also need `fetch_breadth`: both come off the
+    same pull and calling each separately fetches it twice).
     """
-    raise NotImplementedError(
-        "Aggregate advancing/declining volume from a locally stored "
-        "per-symbol daily quotes history."
-    )
+    if not start:
+        raise NotImplementedError(
+            "Needs a start= date to backfill trailing price history -- "
+            "call fetch_market_breadth_and_strength_history(start) directly "
+            "if you also need fetch_breadth, to avoid fetching twice."
+        )
+    _, new_high_low = fetch_market_breadth_and_strength_history(start)
+    return new_high_low
+
+
+def fetch_breadth(start: str | None = None) -> pd.DataFrame:
+    """Advancing/declining volume, market-wide. Columns: advancing_volume,
+    declining_volume. Needs `start` -- see `fetch_new_high_low`.
+    """
+    if not start:
+        raise NotImplementedError(
+            "Needs a start= date -- see fetch_new_high_low."
+        )
+    breadth, _ = fetch_market_breadth_and_strength_history(start)
+    return breadth
 
 
 def fetch_options() -> pd.DataFrame:
@@ -634,18 +796,28 @@ def fetch_bond_index() -> pd.DataFrame:
 
 def fetch_all_raw_data(start: str | None = None) -> dict[str, pd.DataFrame]:
     """Fetch everything indicators.compute_all_raw_indicators can use from
-    this free API. Sources with no free implementation (new_high_low,
-    breadth, bond_index) are silently omitted rather than raising --
-    compute_all_raw_indicators already tolerates missing keys and
-    renormalizes weights over whatever's present, so add them to `raw`
-    yourself once you have a source (local ETL / a bond ETF NAV series).
+    this free API. bond_index still has no free implementation and is
+    silently omitted rather than raising -- compute_all_raw_indicators
+    already tolerates missing keys and renormalizes weights over
+    whatever's present, so add it to `raw` yourself once you have a
+    source (e.g. a bond ETF NAV series).
 
-    `start`, if given, also switches index_price (and so vix, which is
-    derived from it) from the ~10-day snapshot to the real multi-month
-    history via `fetch_index_price_history` -- expect one extra network
-    request per calendar month covered. margin/options/foreign still only
-    ever return their own free-tier window (today / ~1 month) regardless
-    of `start`; see the module docstring for why.
+    `start`, if given:
+      - switches index_price (and so vix, which is derived from it) from
+        the ~10-day snapshot to the real multi-month history via
+        `fetch_index_price_history` -- one extra request per month.
+      - switches foreign's net_buy_sell leg to a real day-by-day backfill
+        via `fetch_foreign_cash_history` -- one request per trading day,
+        several minutes for a multi-year start (see its docstring for the
+        rate-limit pacing this involves).
+      - fetches new_high_low and breadth for the first time at all, via
+        one shared `fetch_market_breadth_and_strength_history` call
+        (again one request per trading day, several minutes).
+    Without `start`, new_high_low and breadth are omitted (they have no
+    meaningful "just today" reading -- new_high_low needs trailing
+    history by definition), same as bond_index. margin and options'
+    windows (today / ~1 month) don't change with or without `start`;
+    see the module docstring for why.
     """
     index_price = fetch_index_price_history(start) if start else fetch_index_price()
     raw: dict[str, pd.DataFrame] = {
@@ -655,15 +827,16 @@ def fetch_all_raw_data(start: str | None = None) -> dict[str, pd.DataFrame]:
         "margin": fetch_margin(),
         "foreign": fetch_foreign(start=start) if start else fetch_foreign(),
     }
-    for name, fetch in (
-        ("new_high_low", fetch_new_high_low),
-        ("breadth", fetch_breadth),
-        ("bond_index", fetch_bond_index),
-    ):
-        try:
-            raw[name] = fetch()
-        except NotImplementedError:
-            continue
+    if start:
+        breadth, new_high_low = fetch_market_breadth_and_strength_history(start)
+        if not breadth.empty:
+            raw["breadth"] = breadth
+        if not new_high_low.empty:
+            raw["new_high_low"] = new_high_low
+    try:
+        raw["bond_index"] = fetch_bond_index()
+    except NotImplementedError:
+        pass
     if start:
         raw = {k: v.loc[start:] for k, v in raw.items()}
     return raw
