@@ -4,10 +4,18 @@ version = "0.1.0"
 description = "Taiwan-market Fear & Greed sentiment index"
 requires-python = ">=3.10"
 dependencies = [
-    "pandas>=2.0",
+    "pandas>=3.0,<4",
     "numpy>=1.24",
     "requests>=2.31",
 ]
+
+# The core index only needs pandas/numpy/requests: the FinMind connector
+# talks to a REST endpoint with `requests`, and the FinLab connector is
+# the only thing that needs the `finlab` package. Keep it optional so the
+# scoring pipeline stays installable without a commercial data account.
+[project.optional-dependencies]
+finlab = ["finlab>=2.0"]
+dev = ["pytest>=7.4"]
 
 [build-system]
 requires = ["setuptools>=68"]

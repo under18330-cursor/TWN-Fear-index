@@ -57,18 +57,28 @@ def _get_dataframe(dataset: str, data_id: str | None = None, start_date: str | N
     return pd.DataFrame(payload["data"])
 
 
-def _aggregate_put_call(raw_options: pd.DataFrame) -> pd.DataFrame:
+def _aggregate_put_call(raw_options: pd.DataFrame, session: str | None = None) -> pd.DataFrame:
     """Pure transform: raw TaiwanOptionDaily rows -> daily put/call volume.
 
     Kept separate from the network call so this logic is unit-testable
     offline (see tests/test_data_sources_finmind.py).
+
+    TaiwanOptionDaily returns one row per (date, contract, strike, side,
+    trading_session), where trading_session is "position" (the regular
+    daytime session) or "after_market" (the night session). session=None
+    sums both into a whole-day figure; pass "position" to restrict the
+    ratio to regular-hours flow.
     """
     if raw_options.empty:
         return pd.DataFrame(columns=["call_volume", "put_volume"])
 
     df = raw_options.copy()
+    if session is not None:
+        df = df[df["trading_session"].astype(str) == session]
+        if df.empty:
+            return pd.DataFrame(columns=["call_volume", "put_volume"])
     df["date"] = pd.to_datetime(df["date"])
-    df["volume"] = pd.to_numeric(df["trading_volume"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
     is_put = df["call_put"].astype(str).str.upper().eq("PUT")
 
     daily = (
@@ -88,18 +98,20 @@ def fetch_put_call_ratio(
     start: str | None = None,
     data_id: str = "TXO",
     token: str | None = None,
+    session: str | None = None,
 ) -> pd.DataFrame:
     """Daily TAIEX option put/call volume. Columns: call_volume, put_volume."""
     raw_options = _get_dataframe(
         DATASETS["option_daily"], data_id=data_id, start_date=start, token=token
     )
-    return _aggregate_put_call(raw_options)
+    return _aggregate_put_call(raw_options, session=session)
 
 
 def augment_with_options(
     raw: dict[str, pd.DataFrame],
     start: str | None = None,
     token: str | None = None,
+    session: str | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Take a raw-data bundle (e.g. from data_sources_finlab.fetch_all_raw_data)
     and add/replace its "options" entry with FinMind's put/call data, so
@@ -107,5 +119,5 @@ def augment_with_options(
     gets computed too.
     """
     augmented = dict(raw)
-    augmented["options"] = fetch_put_call_ratio(start=start, token=token)
+    augmented["options"] = fetch_put_call_ratio(start=start, token=token, session=session)
     return augmented
