@@ -45,15 +45,18 @@ Coverage against what indicators.py needs:
                    proprietary foreign-dealer arm, NT$), futures_net_oi
                    from TAIFEX's institutional-futures breakdown (TAIEX
                    futures, foreign+China net open interest, contracts).
-  vix           -- real for the most recent day(s) via `fetch_taifex_vix_close`
+  vix           -- real for the last ~4 months via `fetch_vix_history`
                    (TAIFEX's own CBOE-formula index, the average over the
                    final minute before close -- not in openapi.taifex.com.tw's
-                   REST catalog, but published as one downloadable file per
-                   trading day off taifex.com.tw/cht/7/vixMinNew). One
-                   request per day, so `fetch_vix` only backfills a handful
-                   of recent days this way by default and falls back to
-                   `realized_volatility` (derived from index_price, no
-                   extra requests) for the rest of the history.
+                   REST catalog, but published as one bulk file per month
+                   off the download links on taifex.com.tw/cht/7/vixMinNew;
+                   older months exist as single-day files at
+                   /cht/7/getVixData, see `fetch_taifex_vix_close`, but
+                   there's no bulk archive reaching further back than
+                   ~4 months either way). `fetch_vix` overlays this real
+                   window on top of `realized_volatility` (derived from
+                   index_price, so it covers the full history for free)
+                   and lets the real data win wherever both exist.
   new_high_low,
   breadth       -- still need locally accumulated per-symbol history (see
                    their docstrings); no free snapshot endpoint aggregates
@@ -85,6 +88,9 @@ ENDPOINTS = {
     "institutional_futures": f"{TAIFEX_BASE}/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate",
     # 臺指選擇權波動率指數逐日檔案 (舊版網站, 每個交易日一支檔案, 含收盤前1分鐘均值)
     "vix_daily_file": "https://www.taifex.com.tw/cht/7/getVixData",
+    # 前3個月每日收盤之臺指選擇權波動率指數 (舊版網站, 每個月一支靜態檔, 同樣含收盤前1分鐘均值;
+    # 只保留最近 ~4 個月, 更早的月份回 200 但內容是一頁 404 錯誤頁)
+    "vix_monthly_file": "https://www.taifex.com.tw/file/taifex/Dailydownload/vix/log2data",
 }
 
 DEFAULT_TIMEOUT = 15
@@ -271,6 +277,32 @@ def _vix_close_from_taifex_file(raw_bytes: bytes, date: pd.Timestamp) -> pd.Data
     return pd.DataFrame(columns=["taiex_vix"]).rename_axis("date")
 
 
+def _vix_from_monthly_file(raw_bytes: bytes) -> pd.DataFrame:
+    """The vixDaily3MNew bulk file: same shape as the per-day file but one
+    row per TRADING DAY instead of per 15 seconds, e.g.
+    "20260814\\t13450000\\t\\t\\t30.22\\t\\t30.23" -- date, the 13:45:00
+    snapshot, then the same "previous 1-minute average" figure as the
+    per-day file's closing row (here the last column, confirmed against
+    a day present in both). A month with no file yet (or too old --
+    only ~4 months are kept) comes back as a 200-status Chinese 404 page
+    rather than a real error, so that's what's actually being detected
+    and rejected here, not just "empty". Columns: taiex_vix.
+    """
+    text = raw_bytes.decode("cp950", errors="ignore")
+    rows = []
+    for line in text.splitlines():
+        cols = [c.strip() for c in line.split("\t") if c.strip()]
+        if len(cols) < 2 or not cols[0].isdigit() or len(cols[0]) != 8:
+            continue  # skips the header row and the 404 page's HTML/prose
+        rows.append((cols[0], cols[-1]))
+    if not rows:
+        return pd.DataFrame(columns=["taiex_vix"]).rename_axis("date")
+    df = pd.DataFrame(rows, columns=["date_str", "value"])
+    df["date"] = pd.to_datetime(df["date_str"], format="%Y%m%d")
+    df["taiex_vix"] = pd.to_numeric(df["value"], errors="coerce")
+    return df.set_index("date")[["taiex_vix"]].sort_index()
+
+
 # ---------------------------------------------------------------------------
 # Network wrappers
 # ---------------------------------------------------------------------------
@@ -365,26 +397,58 @@ def fetch_taifex_vix_close(date: pd.Timestamp | str | None = None) -> pd.DataFra
     return _vix_close_from_taifex_file(resp.content, as_of)
 
 
-def fetch_vix(index_price: pd.DataFrame | None = None, real_days: int = 1) -> pd.DataFrame:
+def fetch_vix_history(start: str, end: str | None = None) -> pd.DataFrame:
+    """Real TAIFEX VIX (the same last-1-min-avg reading as
+    `fetch_taifex_vix_close`), one request per calendar month via the
+    bulk file behind vixDaily3MNew -- but unlike `fetch_index_price_history`,
+    this archive only actually holds the ~4 most recent months; any
+    earlier month's request 200s with a Chinese "content not found" page
+    instead of erroring, which `_vix_from_monthly_file` detects and
+    quietly turns into an empty month rather than bad data. There is no
+    free source for VIX further back than that -- combine with
+    `realized_volatility` for the rest of the history, which `fetch_vix`
+    does automatically.
+    """
+    start_ts = pd.Timestamp(start).replace(day=1)
+    end_ts = pd.Timestamp(end) if end else pd.Timestamp.now()
+    months = pd.date_range(start_ts, end_ts, freq="MS")
+    if months.empty or months[0] != start_ts:
+        months = months.insert(0, start_ts)
+
+    frames = []
+    for month_start in months:
+        url = f"{ENDPOINTS['vix_monthly_file']}/{month_start.strftime('%Y%m')}new.txt"
+        resp = requests.get(url, headers=HEADERS, timeout=DEFAULT_TIMEOUT)
+        resp.raise_for_status()
+        frames.append(_vix_from_monthly_file(resp.content))
+
+    if not frames:
+        return pd.DataFrame(columns=["taiex_vix"]).rename_axis("date")
+    result = pd.concat(frames).sort_index()
+    result = result[~result.index.duplicated(keep="last")]
+    return result.loc[start:end] if end else result.loc[start:]
+
+
+def fetch_vix(index_price: pd.DataFrame | None = None, real_lookback_months: int = 4) -> pd.DataFrame:
     """Realized volatility of TAIEX returns (see `realized_volatility`) as
-    the base series, with the most recent `real_days` trading days
-    overlaid by TAIFEX's own real closing-minute VIX
-    (`fetch_taifex_vix_close`) wherever that day actually has a file --
-    one extra request per day, which is why this doesn't reach back
-    further by default. Fetches index_price itself if not supplied.
+    the base series, overlaid with TAIFEX's real closing-minute VIX
+    (`fetch_vix_history`) for the most recent `real_lookback_months`
+    months where that archive actually has data -- typically 1-4 requests,
+    since months without a real file just come back empty rather than
+    erroring. Real values take priority over the realized-vol estimate
+    wherever both exist. Fetches index_price itself if not supplied.
     """
     if index_price is None:
         index_price = fetch_index_price()
     vix = realized_volatility(index_price)
-    if real_days > 0:
-        recent_days = pd.bdate_range(end=_last_probable_trading_day(), periods=real_days)
-        for day in recent_days:
-            try:
-                real_row = fetch_taifex_vix_close(day)
-            except requests.RequestException:
-                continue
-            if not real_row.empty:
-                vix.loc[real_row.index[0], "taiex_vix"] = real_row["taiex_vix"].iloc[0]
+    if real_lookback_months > 0:
+        start = (pd.Timestamp.now() - pd.DateOffset(months=real_lookback_months)).strftime("%Y-%m-%d")
+        try:
+            real = fetch_vix_history(start)
+        except requests.RequestException:
+            real = pd.DataFrame(columns=["taiex_vix"])
+        if not real.empty:
+            vix = real.combine_first(vix)
     return vix.sort_index()
 
 

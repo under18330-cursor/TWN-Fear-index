@@ -152,6 +152,30 @@ def test_vix_close_from_taifex_file_no_summary_row_is_empty():
     assert list(result.columns) == ["taiex_vix"]
 
 
+def test_vix_from_monthly_file_parses_one_row_per_trading_day():
+    body = (
+        "名稱\t時間\t\t\t前1分鐘\n"
+        "--------\t-------------------\t--------------------\t-------------------\n"
+        "20260803\t13450000\t\t\t39.46\t\t39.47\n"
+        "20260814\t13450000\t\t\t30.22\t\t30.23\n"
+    ).encode("cp950")
+    result = ds._vix_from_monthly_file(body)
+    assert list(result.columns) == ["taiex_vix"]
+    assert result.loc[pd.Timestamp("2026-08-03"), "taiex_vix"] == 39.47
+    assert result.loc[pd.Timestamp("2026-08-14"), "taiex_vix"] == 30.23
+    assert result.index.is_monotonic_increasing
+
+
+def test_vix_from_monthly_file_detects_the_200_status_404_page():
+    body = (
+        "<HTML xmlns='http://www.w3.org/1999/xhtml' lang='zh-TW'>"
+        "<title>404</title><body>content not found</body></html>"
+    ).encode("cp950")
+    result = ds._vix_from_monthly_file(body)
+    assert result.empty
+    assert list(result.columns) == ["taiex_vix"]
+
+
 def test_last_probable_trading_day_rolls_weekend_back_to_friday():
     saturday = pd.Timestamp("2026-08-15")
     sunday = pd.Timestamp("2026-08-16")
