@@ -44,7 +44,14 @@ DATASETS = {
 }
 
 
-def _get_dataframe(dataset: str, data_id: str | None = None, start_date: str | None = None, token: str | None = None) -> pd.DataFrame:
+def _get_dataframe(
+    dataset: str,
+    data_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    token: str | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> pd.DataFrame:
     token = token or os.environ.get("FINMIND_API_TOKEN")
     if not token:
         raise RuntimeError(
@@ -57,8 +64,10 @@ def _get_dataframe(dataset: str, data_id: str | None = None, start_date: str | N
         params["data_id"] = data_id
     if start_date:
         params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
 
-    resp = requests.get(FINMIND_BASE, params=params, timeout=DEFAULT_TIMEOUT)
+    resp = requests.get(FINMIND_BASE, params=params, timeout=timeout)
     resp.raise_for_status()
     payload = resp.json()
     if payload.get("status") != 200:
@@ -114,6 +123,51 @@ def fetch_put_call_ratio(
         DATASETS["option_daily"], data_id=data_id, start_date=start, token=token
     )
     return _aggregate_put_call(raw_options, session=session)
+
+
+def fetch_put_call_ratio_history(
+    start: str,
+    end: str | None = None,
+    data_id: str = "TXO",
+    token: str | None = None,
+    session: str | None = None,
+) -> pd.DataFrame:
+    """Real daily TAIEX option put/call volume over a multi-year range.
+
+    TaiwanOptionDaily is tick-granular (date x contract x strike x side):
+    a single trading day is already ~6,500 rows, so one request spanning
+    years (~4.7M rows for 3 years, extrapolated) times out and isn't
+    practical to hold in memory anyway -- fetched one calendar month at a
+    time instead, aggregating each month down to its daily put/call
+    volume immediately (`_aggregate_put_call`) and discarding the raw
+    rows, so peak memory stays at "one month of raw ticks", not "three
+    years of them". ~36 requests for 3 years, a couple seconds each.
+    Columns: call_volume, put_volume.
+    """
+    start_ts = pd.Timestamp(start).replace(day=1)
+    end_ts = pd.Timestamp(end) if end else pd.Timestamp.now()
+    months = pd.date_range(start_ts, end_ts, freq="MS")
+    if months.empty or months[0] != start_ts:
+        months = months.insert(0, start_ts)
+
+    frames = []
+    for month_start in months:
+        month_end = min(month_start + pd.offsets.MonthEnd(0), end_ts)
+        raw = _get_dataframe(
+            DATASETS["option_daily"],
+            data_id=data_id,
+            start_date=month_start.strftime("%Y-%m-%d"),
+            end_date=month_end.strftime("%Y-%m-%d"),
+            token=token,
+            timeout=60,
+        )
+        frames.append(_aggregate_put_call(raw, session=session))
+
+    if not frames:
+        return pd.DataFrame(columns=["call_volume", "put_volume"]).rename_axis("date")
+    result = pd.concat(frames).sort_index()
+    result = result[~result.index.duplicated(keep="last")]
+    return result.loc[start:end] if end else result.loc[start:]
 
 
 def augment_with_options(

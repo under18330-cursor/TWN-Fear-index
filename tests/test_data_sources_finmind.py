@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pandas as pd
 import pytest
 
+import twn_fear_greed.data_sources_finmind as fm
 from twn_fear_greed.data_sources_finmind import _aggregate_put_call, _bond_index_from_price
 
 
@@ -120,3 +121,36 @@ def test_bond_index_from_price_empty_input():
     result = _bond_index_from_price(pd.DataFrame(columns=["date", "close"]))
     assert result.empty
     assert list(result.columns) == ["close"]
+
+
+def test_fetch_put_call_ratio_history_chunks_by_calendar_month(monkeypatch):
+    calls = []
+
+    def fake_get_dataframe(dataset, data_id=None, start_date=None, end_date=None, token=None, timeout=15):
+        calls.append((start_date, end_date))
+        # one distinct row per month so the concatenated result is checkable
+        day = start_date  # first day of that month's chunk
+        return _raw([day], ["call"], ["10"])
+
+    monkeypatch.setattr(fm, "_get_dataframe", fake_get_dataframe)
+
+    result = fm.fetch_put_call_ratio_history("2026-06-15", "2026-08-14")
+
+    # three calendar months touched: Jun, Jul, Aug -- each capped to the actual range
+    assert calls == [
+        ("2026-06-01", "2026-06-30"),
+        ("2026-07-01", "2026-07-31"),
+        ("2026-08-01", "2026-08-14"),
+    ]
+    # the June chunk's row lands on 2026-06-01, before the requested start
+    # (2026-06-15) -- final .loc[start:end] trim correctly drops it, same
+    # as fetch_index_price_history's analogous trim
+    assert list(result.index) == [pd.Timestamp("2026-07-01"), pd.Timestamp("2026-08-01")]
+    assert list(result.columns) == ["call_volume", "put_volume"]
+
+
+def test_fetch_put_call_ratio_history_empty_range_returns_empty_frame(monkeypatch):
+    monkeypatch.setattr(fm, "_get_dataframe", lambda *a, **k: pd.DataFrame(columns=["date", "call_put", "volume"]))
+    result = fm.fetch_put_call_ratio_history("2026-08-01", "2026-08-14")
+    assert result.empty
+    assert list(result.columns) == ["call_volume", "put_volume"]
