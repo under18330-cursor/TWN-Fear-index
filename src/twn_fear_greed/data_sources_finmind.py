@@ -1,11 +1,20 @@
 """FinMind (https://github.com/FinMind/FinMind) data connector.
 
-Fills the one gap FinLab left open: TAIEX option (TXO) Put/Call volume --
-FinLab has no options dataset at all (see data_sources_finlab.py). This
+Fills two gaps neither FinLab nor the free TWSE/TAIFEX connectors
+(data_sources.py) can: TAIEX option (TXO) Put/Call volume (FinLab has no
+options dataset at all -- see data_sources_finlab.py) and the
+safe-haven-demand indicator's bond leg (TWSE/TAIFEX's own free endpoints
+have no bond series; Taiwan's long-duration Treasury ETFs are TPEx-listed,
+not TWSE, and FinMind's TaiwanStockPrice dataset covers both markets
+under one dataset name -- no separate TPEx integration needed). This
 talks to FinMind's public v4 REST API directly with `requests` instead of
 the `FinMind` pip package: that package pulls in the `ta` indicator
 library as a dependency, which failed to build in this sandbox, and isn't
-needed just to call two REST endpoints.
+needed just to call a couple of REST endpoints.
+
+Unlike the free TWSE/TAIFEX classic endpoints (data_sources.py), FinMind
+takes a real start_date/end_date range in one request -- a 3-year pull is
+one call, not one per trading day.
 
 Authentication
 ---------------
@@ -120,4 +129,53 @@ def augment_with_options(
     """
     augmented = dict(raw)
     augmented["options"] = fetch_put_call_ratio(start=start, token=token, session=session)
+    return augmented
+
+
+DEFAULT_BOND_ETF = "00679B"  # 元大美債20年 -- Yuanta 20+ Year US Treasury Bond ETF, TPEx
+
+
+def _bond_index_from_price(raw_price: pd.DataFrame) -> pd.DataFrame:
+    """Pure transform: raw TaiwanStockPrice rows for a bond ETF -> the
+    bond_index shape indicators.safe_haven_demand expects. Columns: close.
+    """
+    if raw_price.empty:
+        return pd.DataFrame(columns=["close"]).rename_axis("date")
+    df = raw_price.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return df.set_index("date")[["close"]].sort_index()
+
+
+def fetch_bond_index(
+    start: str | None = None,
+    data_id: str = DEFAULT_BOND_ETF,
+    token: str | None = None,
+) -> pd.DataFrame:
+    """Daily close of a Taiwan-listed long-duration bond ETF, as the
+    safe-haven-demand indicator's bond leg (see indicators.safe_haven_demand).
+
+    Defaults to 00679B (元大美債20年, Yuanta 20+ Year US Treasury Bond ETF,
+    TPEx-listed) -- the standard long-duration Treasury proxy for a
+    "stocks vs. bonds" flight-to-safety signal, and liquid (tens of
+    millions of shares/day) so its price series shouldn't have stale gaps.
+    Pass a different `data_id` for a different bond ETF (e.g. 00687B,
+    國泰20年美債, a comparable alternative). Columns: close.
+    """
+    raw_price = _get_dataframe("TaiwanStockPrice", data_id=data_id, start_date=start, token=token)
+    return _bond_index_from_price(raw_price)
+
+
+def augment_with_bond_index(
+    raw: dict[str, pd.DataFrame],
+    start: str | None = None,
+    token: str | None = None,
+    data_id: str = DEFAULT_BOND_ETF,
+) -> dict[str, pd.DataFrame]:
+    """Take a raw-data bundle and add/replace its "bond_index" entry with
+    a FinMind-sourced bond ETF close series, so the safe_haven indicator
+    -- otherwise skipped for lack of a free source -- gets computed too.
+    """
+    augmented = dict(raw)
+    augmented["bond_index"] = fetch_bond_index(start=start, token=token, data_id=data_id)
     return augmented

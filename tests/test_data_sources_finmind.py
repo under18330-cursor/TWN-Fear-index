@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pandas as pd
 import pytest
 
-from twn_fear_greed.data_sources_finmind import _aggregate_put_call
+from twn_fear_greed.data_sources_finmind import _aggregate_put_call, _bond_index_from_price
 
 
 def _raw(dates, sides, volumes, sessions=None):
@@ -98,3 +98,25 @@ def test_aggregate_put_call_unknown_session_yields_empty():
     result = _aggregate_put_call(raw, session="nonexistent")
     assert result.empty
     assert list(result.columns) == ["call_volume", "put_volume"]
+
+
+def test_bond_index_from_price_keeps_only_close_indexed_by_date():
+    raw = pd.DataFrame(
+        {
+            "date": ["2026-07-01", "2026-07-02"],
+            "stock_id": ["00679B", "00679B"],
+            "open": [27.07, 27.10],
+            "close": [27.05, 27.11],
+        }
+    )
+    result = _bond_index_from_price(raw)
+    assert list(result.columns) == ["close"]
+    assert result.loc[pd.Timestamp("2026-07-01"), "close"] == 27.05
+    assert result.loc[pd.Timestamp("2026-07-02"), "close"] == 27.11
+    assert result.index.is_monotonic_increasing
+
+
+def test_bond_index_from_price_empty_input():
+    result = _bond_index_from_price(pd.DataFrame(columns=["date", "close"]))
+    assert result.empty
+    assert list(result.columns) == ["close"]
