@@ -123,7 +123,37 @@ examples/
 tests/
   test_scoring.py                  # 正規化與合成邏輯的單元測試
   test_data_sources_finmind.py     # Put/Call 聚合邏輯的單元測試（純函式，不需網路）
+  test_check_data_sources.py       # 檢測器驗證邏輯的單元測試（餵壞資料確認它會 FAIL）
+scripts/
+  check_data_sources.py      # 實際打線上 API，驗證各資料源是否可用、欄位是否還對得上
 ```
+
+## 實際資料抓取檢測
+
+`data_sources*.py` 都需要網路（FinLab/FinMind 還需要 token），所以不在單元測試覆蓋範圍內。
+`scripts/check_data_sources.py` 就是它們的手動對照工具：實際打線上端點，然後檢查**回來的東西
+是不是還符合 fetcher 的假設**。
+
+```bash
+python scripts/check_data_sources.py                 # 全部資料源
+python scripts/check_data_sources.py --source taifex # 只測期交所
+python scripts/check_data_sources.py --pipeline      # 再用真實資料跑完整指數
+python scripts/check_data_sources.py -v              # 失敗時印出 traceback
+```
+
+重點在第二層檢查。抓取失敗會直接噴錯很好發現；真正危險的是**沒噴錯但資料是錯的**——
+例如交易所改了欄位名稱（`indicators.py` 會 `KeyError` 然後靜靜跳過那個子指標），
+或是回傳民國日期 `1130815`，被 `pd.to_datetime` 開心地解析成西元 1130 年。
+所以每個檢查都會驗證解析後的結果，而不只是 HTTP 狀態碼：
+
+- 欄位名稱是否符合 `indicators.py` 期待的 schema（缺欄位會指出實際拿到哪些欄位）
+- 日期索引是否落在合理區間（抓民國/西元曆法混用）、是否排序、有無重複
+- 數值欄位解析後是否全為 NaN、資料是否過期（>7 天未更新會標記）
+- Put/Call 端點當天是否同時有買權與賣權（`fetch_options()` 是用位置指定欄位名，
+  只有單邊的日子會 `ValueError`）
+
+沒設定 token 的資料源會標記為 `skip` 而不是 `FAIL`；只要沒有任何 `FAIL`，exit code 就是 0，
+可以直接掛進 cron 或 CI 當作資料源健康檢查。
 
 ## 安裝與使用
 
