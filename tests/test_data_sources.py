@@ -201,6 +201,68 @@ def test_realized_volatility_is_annualized_and_positive():
     assert result["taiex_vix"].dropna().gt(0).all()
 
 
+def test_fetch_foreign_cash_history_chunks_and_cools_down(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(ds.time, "sleep", lambda s: sleep_calls.append(s))
+
+    def fake_get_json(url, params=None):
+        return {
+            "date": params["dayDate"],
+            "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+            "data": [["外資及陸資(不含外資自營商)", "1", "1", "100"]],
+        }
+
+    monkeypatch.setattr(ds, "_get_json", fake_get_json)
+
+    result = ds.fetch_foreign_cash_history("2024-01-01", "2024-01-05", chunk_size=2, cooldown_seconds=99)
+
+    assert len(result) == 5  # 2024-01-01..05 are all weekdays
+    # chunk_size=2 over 5 requests: cooldown fires before request index 2 and 4
+    assert sleep_calls.count(99) == 2
+
+
+def test_fetch_foreign_cash_history_retries_once_then_skips_a_persistently_failing_day(monkeypatch):
+    monkeypatch.setattr(ds.time, "sleep", lambda s: None)
+
+    def flaky_get_json(url, params=None):
+        if params["dayDate"] == "20240102":
+            raise ValueError("simulated WAF block")
+        return {
+            "date": params["dayDate"],
+            "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+            "data": [["外資及陸資(不含外資自營商)", "1", "1", "50"]],
+        }
+
+    monkeypatch.setattr(ds, "_get_json", flaky_get_json)
+    result = ds.fetch_foreign_cash_history("2024-01-01", "2024-01-03")
+
+    assert pd.Timestamp("2024-01-02") not in result.index
+    assert pd.Timestamp("2024-01-01") in result.index
+    assert pd.Timestamp("2024-01-03") in result.index
+
+
+def test_fetch_foreign_with_start_backfills_cash_and_defaults_futures_to_zero(monkeypatch):
+    cash_history = pd.DataFrame(
+        {"net_buy_sell": [100.0, 200.0, 300.0]},
+        index=pd.DatetimeIndex(["2026-08-10", "2026-08-11", "2026-08-12"], name="date"),
+    )
+    monkeypatch.setattr(ds, "fetch_foreign_cash_history", lambda start, end=None: cash_history)
+    monkeypatch.setattr(ds, "_last_probable_trading_day", lambda now=None: pd.Timestamp("2026-08-12"))
+    monkeypatch.setattr(ds, "_get_json", lambda url, params=None: [])
+    monkeypatch.setattr(
+        ds,
+        "_foreign_futures_oi_from_institutional",
+        lambda raw, as_of: pd.DataFrame({"futures_net_oi": [-999.0]}, index=pd.DatetimeIndex([as_of], name="date")),
+    )
+
+    result = ds.fetch_foreign(start="2026-08-10")
+
+    assert result.loc[pd.Timestamp("2026-08-10"), "futures_net_oi"] == 0.0
+    assert result.loc[pd.Timestamp("2026-08-11"), "futures_net_oi"] == 0.0
+    assert result.loc[pd.Timestamp("2026-08-12"), "futures_net_oi"] == -999.0
+    assert result.loc[pd.Timestamp("2026-08-12"), "net_buy_sell"] == 300.0
+
+
 def test_fetch_all_raw_data_omits_unimplemented_sources(monkeypatch):
     idx = pd.DataFrame({"close": [100.0, 101.0]}, index=pd.bdate_range("2026-08-01", periods=2))
     monkeypatch.setattr(ds, "fetch_index_price", lambda: idx)

@@ -40,11 +40,17 @@ Coverage against what indicators.py needs:
                    The classic marginTrading/MI_MARGN endpoint that might
                    offer history returns empty for every date+selectType
                    combination tried -- left on the openapi snapshot.
-  foreign       -- both legs real, today only: net_buy_sell from the
-                   classic fund/BFI82U report (外資及陸資, excluding the
-                   proprietary foreign-dealer arm, NT$), futures_net_oi
-                   from TAIFEX's institutional-futures breakdown (TAIEX
-                   futures, foreign+China net open interest, contracts).
+  foreign       -- net_buy_sell (外資及陸資現貨買賣超, excluding the
+                   proprietary foreign-dealer arm, NT$) has real multi-year
+                   history via `fetch_foreign_cash_history` (classic
+                   fund/BFI82U, one request per trading DAY -- there's no
+                   month-batch for this report, so budget minutes for a
+                   multi-year `start`). futures_net_oi (TAIEX futures,
+                   foreign+China net open interest, contracts, from
+                   TAIFEX's institutional-futures breakdown) has no
+                   historical query at any layer found -- always today
+                   only, filled with 0.0 rather than NaN on backfilled
+                   rows so the real cash leg still drives the indicator.
   vix           -- real for the last ~4 months via `fetch_vix_history`
                    (TAIFEX's own CBOE-formula index, the average over the
                    final minute before close -- not in openapi.taifex.com.tw's
@@ -65,6 +71,8 @@ Coverage against what indicators.py needs:
 """
 
 from __future__ import annotations
+
+import time
 
 import pandas as pd
 import requests
@@ -100,10 +108,43 @@ DEFAULT_TIMEOUT = 15
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
-def _get_json(url: str, params: dict | None = None) -> list[dict] | dict:
-    resp = requests.get(url, params=params, headers=HEADERS, timeout=DEFAULT_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+def _get_json(url: str, params: dict | None = None, retries: int = 3) -> list[dict] | dict:
+    """A handful of these fetchers loop hundreds of requests in a row for
+    a multi-year backfill (`fetch_index_price_history`,
+    `fetch_foreign_cash_history`, `fetch_vix_history`); at that volume a
+    transient blip -- a timeout, a connection reset, an occasional
+    non-JSON response body -- is a when, not an if. Retried with a short
+    linear backoff rather than propagating immediately and losing the
+    whole loop over one bad request.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=DEFAULT_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_exc
+
+
+def _get_bytes(url: str, params: dict | None = None, retries: int = 3) -> bytes:
+    """Same retry treatment as `_get_json`, for the file endpoints (the
+    VIX daily/monthly files) that need raw bytes rather than parsed JSON.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=DEFAULT_TIMEOUT)
+            resp.raise_for_status()
+            return resp.content
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_exc
 
 
 def _num(series: pd.Series) -> pd.Series:
@@ -387,14 +428,8 @@ def fetch_taifex_vix_close(date: pd.Timestamp | str | None = None) -> pd.DataFra
     detect, since it only knows about weekends).
     """
     as_of = _last_probable_trading_day(pd.Timestamp(date) if date else None)
-    resp = requests.get(
-        ENDPOINTS["vix_daily_file"],
-        params={"filesname": as_of.strftime("%Y%m%d")},
-        headers=HEADERS,
-        timeout=DEFAULT_TIMEOUT,
-    )
-    resp.raise_for_status()
-    return _vix_close_from_taifex_file(resp.content, as_of)
+    content = _get_bytes(ENDPOINTS["vix_daily_file"], params={"filesname": as_of.strftime("%Y%m%d")})
+    return _vix_close_from_taifex_file(content, as_of)
 
 
 def fetch_vix_history(start: str, end: str | None = None) -> pd.DataFrame:
@@ -418,9 +453,7 @@ def fetch_vix_history(start: str, end: str | None = None) -> pd.DataFrame:
     frames = []
     for month_start in months:
         url = f"{ENDPOINTS['vix_monthly_file']}/{month_start.strftime('%Y%m')}new.txt"
-        resp = requests.get(url, headers=HEADERS, timeout=DEFAULT_TIMEOUT)
-        resp.raise_for_status()
-        frames.append(_vix_from_monthly_file(resp.content))
+        frames.append(_vix_from_monthly_file(_get_bytes(url)))
 
     if not frames:
         return pd.DataFrame(columns=["taiex_vix"]).rename_axis("date")
@@ -477,20 +510,101 @@ def fetch_margin() -> pd.DataFrame:
     return _margin_balance_from_stockwise(_get_json(ENDPOINTS["margin_balance"]), as_of)
 
 
-def fetch_foreign() -> pd.DataFrame:
-    """外資現貨買賣超金額 (NT$, via BFI82U) + 台指期未平倉多空淨口數 (contracts,
-    via TAIFEX), most recent session for both legs. Columns: net_buy_sell,
-    futures_net_oi.
+def fetch_foreign_cash_history(
+    start: str,
+    end: str | None = None,
+    chunk_size: int = 40,
+    cooldown_seconds: float = 45.0,
+) -> pd.DataFrame:
+    """Real 外資及陸資 net buy/sell (NT$), one BFI82U request per calendar
+    day -- unlike the TAIEX/VIX series, there is no month-batch file for
+    this report at any layer found, so a multi-year `start` means one
+    request per weekday and takes minutes, not seconds (roughly 250
+    requests/year).
 
-    BFI82U (unlike the openapi endpoints) returns an explicit "no data"
-    response for a non-trading day rather than the prior session's figures,
-    so a weekend run walks back day by day until it finds one (capped at 7
-    calendar days, comfortably more than any TWSE holiday block). The
-    futures leg always self-reports the real last session regardless of
-    query day, so it needs no such retry. The two legs' dates aren't
-    forced to match -- a lag on either side surfaces as NaN on that leg
-    for that row rather than silently misaligning the two.
+    BFI82U's server rate-limits at roughly 50 requests within a short
+    rolling window regardless of the pacing between individual requests
+    -- confirmed empirically (the same block at request #50 whether paced
+    at ~0.15s or ~0.5s apart): a WAF page served with a 307 status that
+    only fails once the body is parsed as JSON, and which a 30s pause was
+    enough to clear in testing. Requests are issued in chunks of
+    `chunk_size` (comfortably under 50) separated by a `cooldown_seconds`
+    pause (kept with margin over the observed 30s). If a single request
+    still fails despite that pacing, one extra cooldown-and-retry is
+    attempted before giving up on that one day and moving on -- a
+    multi-year fetch shouldn't abort over one bad day the way the first
+    version of this function did.
+
+    Non-trading weekdays come back empty from `_foreign_cash_from_bfi82u`
+    and are silently skipped, same as always. Columns: net_buy_sell.
     """
+    dates = pd.bdate_range(start, end or pd.Timestamp.now())
+    frames = []
+    for i, d in enumerate(dates):
+        if i > 0 and i % chunk_size == 0:
+            time.sleep(cooldown_seconds)
+        params = {"dayDate": d.strftime("%Y%m%d"), "type": "day", "response": "json"}
+        try:
+            payload = _get_json(ENDPOINTS["foreign_cash"], params=params)
+        except (requests.RequestException, ValueError):
+            time.sleep(cooldown_seconds)
+            try:
+                payload = _get_json(ENDPOINTS["foreign_cash"], params=params)
+            except (requests.RequestException, ValueError):
+                continue
+        frame = _foreign_cash_from_bfi82u(payload)
+        if not frame.empty:
+            frames.append(frame)
+        time.sleep(0.2)
+    if not frames:
+        return pd.DataFrame(columns=["net_buy_sell"]).rename_axis("date")
+    result = pd.concat(frames).sort_index()
+    return result[~result.index.duplicated(keep="last")]
+
+
+def fetch_foreign(start: str | None = None) -> pd.DataFrame:
+    """外資現貨買賣超金額 (NT$, via BFI82U) + 台指期未平倉多空淨口數 (contracts,
+    via TAIFEX). Columns: net_buy_sell, futures_net_oi.
+
+    futures_net_oi has no historical query at any layer found -- TAIFEX's
+    institutional-futures endpoint ignores date params entirely and
+    always reflects the latest session, unlike BFI82U -- so it's only
+    ever real for the most recent trading day, `start` or not.
+
+    Without `start`: most recent session for both legs. BFI82U returns
+    an explicit "no data" response for a non-trading day rather than the
+    prior session's figures, so a weekend run walks back day by day
+    until it finds one (capped at 7 calendar days). The two legs' dates
+    aren't forced to match -- a lag on either side surfaces as NaN on
+    that leg for that row.
+
+    With `start`: net_buy_sell is backfilled for the whole range via
+    `fetch_foreign_cash_history` (budget several minutes). Since
+    futures_net_oi can't be backfilled the same way, older rows get 0.0
+    there rather than NaN, so the real cash leg still drives the
+    indicator on those days instead of the whole row going NaN -- same
+    convention as the always-0.0 net_buy_sell fallback this replaces
+    for the no-`start` case.
+    """
+    futures_oi = _foreign_futures_oi_from_institutional(
+        _get_json(ENDPOINTS["institutional_futures"]), _last_probable_trading_day()
+    )
+
+    if start:
+        cash = fetch_foreign_cash_history(start)
+        if cash.empty:
+            return pd.DataFrame(columns=["net_buy_sell", "futures_net_oi"]).rename_axis("date")
+        result = cash.copy()
+        result["futures_net_oi"] = 0.0
+        if not futures_oi.empty:
+            latest = futures_oi.index[0]
+            latest_oi = futures_oi["futures_net_oi"].iloc[0]
+            if latest in result.index:
+                result.loc[latest, "futures_net_oi"] = latest_oi
+            else:
+                result.loc[latest, ["net_buy_sell", "futures_net_oi"]] = [float("nan"), latest_oi]
+        return result.sort_index()
+
     cash = pd.DataFrame(columns=["net_buy_sell"]).rename_axis("date")
     probe = _last_probable_trading_day()
     for _ in range(7):
@@ -503,9 +617,6 @@ def fetch_foreign() -> pd.DataFrame:
             break
         probe = _last_probable_trading_day(probe - pd.Timedelta(days=1))
 
-    futures_oi = _foreign_futures_oi_from_institutional(
-        _get_json(ENDPOINTS["institutional_futures"]), _last_probable_trading_day()
-    )
     return cash.join(futures_oi["futures_net_oi"], how="outer")
 
 
@@ -542,7 +653,7 @@ def fetch_all_raw_data(start: str | None = None) -> dict[str, pd.DataFrame]:
         "options": fetch_options(),
         "vix": fetch_vix(index_price),
         "margin": fetch_margin(),
-        "foreign": fetch_foreign(),
+        "foreign": fetch_foreign(start=start) if start else fetch_foreign(),
     }
     for name, fetch in (
         ("new_high_low", fetch_new_high_low),
