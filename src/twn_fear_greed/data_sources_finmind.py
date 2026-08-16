@@ -41,6 +41,7 @@ DEFAULT_TIMEOUT = 15
 
 DATASETS = {
     "option_daily": "TaiwanOptionDaily",
+    "margin": "TaiwanStockMarginPurchaseShortSale",
 }
 
 
@@ -233,3 +234,58 @@ def augment_with_bond_index(
     augmented = dict(raw)
     augmented["bond_index"] = fetch_bond_index(start=start, token=token, data_id=data_id)
     return augmented
+
+
+def _margin_balance_from_stock(raw: pd.DataFrame) -> pd.DataFrame:
+    """Pure transform: one stock's raw TaiwanStockMarginPurchaseShortSale
+    rows -> its daily margin balance. Columns: margin_balance (as
+    FinMind reports MarginPurchaseTodayBalance -- board lots, same
+    convention as the TWSE-derived per-stock figures elsewhere in this
+    project; only relative day-to-day change is used downstream, so the
+    exact unit doesn't matter as long as it's consistent).
+    """
+    if raw.empty:
+        return pd.DataFrame(columns=["margin_balance"]).rename_axis("date")
+    df = raw.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["margin_balance"] = pd.to_numeric(df["MarginPurchaseTodayBalance"], errors="coerce")
+    return df.set_index("date")[["margin_balance"]].sort_index()
+
+
+def fetch_margin_history_for_stock(
+    stock_id: str,
+    start: str,
+    end: str | None = None,
+    token: str | None = None,
+) -> pd.DataFrame:
+    """One stock's real daily margin balance over a date range -- a
+    single request, since (unlike TaiwanOptionDaily) this dataset is
+    small enough per stock not to need month-chunking. Columns:
+    margin_balance. See `_aggregate_margin_history` for combining many
+    stocks into a market-wide total, and the module docstring / project
+    notes for why this is fetched one stock at a time: FinMind's
+    market-wide query (no data_id) 400s on the free tier ("Your level is
+    register") -- a paid Backer-or-above tier unlocks it in one request;
+    the free-tier alternative is one request per stock, paced under the
+    600 req/hr limit (~1,100 TWSE-listed common stocks means budgeting a
+    couple of hours for a full backfill).
+    """
+    raw = _get_dataframe(DATASETS["margin"], data_id=stock_id, start_date=start, end_date=end, token=token)
+    return _margin_balance_from_stock(raw)
+
+
+def _aggregate_margin_history(per_stock: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Sum many stocks' margin_balance series (as returned by
+    `fetch_margin_history_for_stock`) into one market-wide daily total.
+    A stock missing data for a given date contributes 0 for that date
+    (not excluded), so a handful of failed/skipped stocks in a large
+    backfill don't bias the total down disproportionately more on some
+    days than others -- they're just a small, roughly constant
+    undercount throughout. Columns: margin_balance.
+    """
+    frames = [df["margin_balance"] for df in per_stock.values() if not df.empty]
+    if not frames:
+        return pd.DataFrame(columns=["margin_balance"]).rename_axis("date")
+    combined = pd.concat(frames, axis=1)
+    total = combined.sum(axis=1, skipna=True).sort_index()
+    return total.to_frame("margin_balance")

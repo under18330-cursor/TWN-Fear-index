@@ -7,7 +7,12 @@ import pandas as pd
 import pytest
 
 import twn_fear_greed.data_sources_finmind as fm
-from twn_fear_greed.data_sources_finmind import _aggregate_put_call, _bond_index_from_price
+from twn_fear_greed.data_sources_finmind import (
+    _aggregate_margin_history,
+    _aggregate_put_call,
+    _bond_index_from_price,
+    _margin_balance_from_stock,
+)
 
 
 def _raw(dates, sides, volumes, sessions=None):
@@ -154,3 +159,50 @@ def test_fetch_put_call_ratio_history_empty_range_returns_empty_frame(monkeypatc
     result = fm.fetch_put_call_ratio_history("2026-08-01", "2026-08-14")
     assert result.empty
     assert list(result.columns) == ["call_volume", "put_volume"]
+
+
+def test_margin_balance_from_stock_reads_today_balance():
+    raw = pd.DataFrame(
+        {
+            "date": ["2026-08-03", "2026-08-04"],
+            "stock_id": ["2330", "2330"],
+            "MarginPurchaseTodayBalance": [30003, 30500],
+        }
+    )
+    result = _margin_balance_from_stock(raw)
+    assert list(result.columns) == ["margin_balance"]
+    assert result.loc[pd.Timestamp("2026-08-03"), "margin_balance"] == 30003
+    assert result.loc[pd.Timestamp("2026-08-04"), "margin_balance"] == 30500
+
+
+def test_margin_balance_from_stock_empty_input():
+    result = _margin_balance_from_stock(pd.DataFrame(columns=["date", "MarginPurchaseTodayBalance"]))
+    assert result.empty
+    assert list(result.columns) == ["margin_balance"]
+
+
+def test_aggregate_margin_history_sums_across_stocks():
+    per_stock = {
+        "2330": pd.DataFrame({"margin_balance": [100.0, 110.0]}, index=pd.DatetimeIndex(["2026-08-03", "2026-08-04"])),
+        "2317": pd.DataFrame({"margin_balance": [50.0, 60.0]}, index=pd.DatetimeIndex(["2026-08-03", "2026-08-04"])),
+    }
+    result = _aggregate_margin_history(per_stock)
+    assert result.loc[pd.Timestamp("2026-08-03"), "margin_balance"] == 150.0
+    assert result.loc[pd.Timestamp("2026-08-04"), "margin_balance"] == 170.0
+
+
+def test_aggregate_margin_history_missing_stock_day_contributes_zero_not_nan():
+    per_stock = {
+        "2330": pd.DataFrame({"margin_balance": [100.0]}, index=pd.DatetimeIndex(["2026-08-03"])),
+        # 2317 only has a later date -- no overlap with 2330 on 2026-08-03
+        "2317": pd.DataFrame({"margin_balance": [50.0]}, index=pd.DatetimeIndex(["2026-08-04"])),
+    }
+    result = _aggregate_margin_history(per_stock)
+    assert result.loc[pd.Timestamp("2026-08-03"), "margin_balance"] == 100.0
+    assert result.loc[pd.Timestamp("2026-08-04"), "margin_balance"] == 50.0
+
+
+def test_aggregate_margin_history_empty_input():
+    result = _aggregate_margin_history({})
+    assert result.empty
+    assert list(result.columns) == ["margin_balance"]
