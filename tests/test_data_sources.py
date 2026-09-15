@@ -93,11 +93,14 @@ def test_put_call_from_ratio_parses_ad_dates():
     assert result.index.is_monotonic_increasing
 
 
-def test_margin_balance_from_stockwise_sums_across_stocks():
+def test_margin_balance_from_stockwise_sums_common_stocks_only():
     raw = [
         {"股票代號": "2330", "融資今日餘額": "9427"},
         {"股票代號": "2317", "融資今日餘額": "1631"},
-        {"股票代號": "0050", "融資今日餘額": ""},  # blank -> excluded from sum
+        {"股票代號": "2454", "融資今日餘額": ""},  # blank -> excluded from sum
+        {"股票代號": "0050", "融資今日餘額": "5000"},  # ETF -> excluded
+        {"股票代號": "00400A", "融資今日餘額": "8638"},  # active ETF -> excluded
+        {"股票代號": "030001", "融資今日餘額": "77"},  # warrant -> excluded
     ]
     as_of = pd.Timestamp("2026-08-14")
     result = ds._margin_balance_from_stockwise(raw, as_of)

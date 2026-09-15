@@ -215,14 +215,22 @@ def _put_call_from_ratio(raw: list[dict]) -> pd.DataFrame:
 
 
 def _margin_balance_from_stockwise(raw: list[dict], as_of: pd.Timestamp) -> pd.DataFrame:
-    """MI_MARGN rows (one per listed stock, no date field of its own) ->
-    a single market-wide total for `as_of`, summing 融資今日餘額 (board
-    lots) across every stock. Columns: margin_balance.
+    """MI_MARGN rows (one per listed instrument, no date field of its own)
+    -> a single market-wide total for `as_of`, summing 融資今日餘額 (board
+    lots) across ordinary common stocks only. Columns: margin_balance.
+
+    Restricted to `COMMON_STOCK_CODE` for the same reason as
+    `_market_snapshot_from_mi_index`: the payload also carries ETFs
+    (incl. actively-managed "00xxxA" ones), warrants, etc., which inflate
+    the unfiltered sum ~40% and -- more importantly -- would make this
+    series inconsistent with the FinMind per-stock backfill, which only
+    ever covered the common-stock universe.
     """
     if not raw:
         return pd.DataFrame(columns=["margin_balance"]).rename_axis("date")
     df = pd.DataFrame(raw)
-    total = _num(df["融資今日餘額"]).sum(skipna=True)
+    is_common = df["股票代號"].astype(str).map(lambda c: bool(COMMON_STOCK_CODE.fullmatch(c)))
+    total = _num(df.loc[is_common, "融資今日餘額"]).sum(skipna=True)
     return pd.DataFrame({"margin_balance": [total]}, index=pd.DatetimeIndex([as_of], name="date"))
 
 
