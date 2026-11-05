@@ -33,13 +33,28 @@ Coverage against what indicators.py needs:
                    (classic MI_5MINS_HIST, one request per month); the
                    quick `fetch_index_price` (openapi, ~10 trading days,
                    one request) is kept for a fast last-few-days read.
-  options       -- real, ~1 month (PutCallRatio; official TXO put/call, no
-                   need to hand-aggregate raw option legs)
-  margin        -- real, today only (MI_MARGN is per-stock; summed here
-                   into one market-wide total, in board lots (張), not NT$).
-                   The classic marginTrading/MI_MARGN endpoint that might
-                   offer history returns empty for every date+selectType
-                   combination tried -- left on the openapi snapshot.
+  options       -- real, ~1 month via openapi PutCallRatio (official TXO
+                   put/call, no need to hand-aggregate raw option legs),
+                   and real multi-year history via
+                   `fetch_put_call_ratio_history_taifex` (the classic
+                   taifex.com.tw/cht/3/pcRatioDown CSV download, which
+                   honors a date range of up to 30 days per request).
+                   The openapi snapshot was observed frozen a month
+                   behind (last row 2026-10-06 on 2026-11-05), so the
+                   download is the one to trust for "today".
+  margin        -- MI_MARGN is per-stock; summed here into one market-wide
+                   total, in board lots (張), not NT$. The openapi snapshot
+                   (`fetch_margin`) carries no date and was observed still
+                   showing the PRIOR session's figures late in the evening,
+                   so for "today" prefer `fetch_margin_history(dates=[day])`,
+                   whose payload states its own date and is empty until
+                   the day is actually published.
+                   Real history via `fetch_margin_history` (classic
+                   marginTrading/MI_MARGN with date=YYYYMMDD and
+                   selectType=ALL -- earlier probes without selectType
+                   came back empty; with it the per-stock table is there,
+                   one request per trading day, same rate-limit pacing as
+                   BFI82U).
   foreign       -- net_buy_sell (外資及陸資現貨買賣超, excluding the
                    proprietary foreign-dealer arm, NT$) has real multi-year
                    history via `fetch_foreign_cash_history` (classic
@@ -75,7 +90,12 @@ Coverage against what indicators.py needs:
                    snapshots -- new_high_low needs a real trailing
                    252-day window before its first non-NaN value, same as
                    any other rolling indicator.
-  bond_index    -- still needs an external bond/ETF NAV series.
+  bond_index    -- real, full history via `fetch_bond_index_tpex`: the
+                   long-duration Treasury ETFs used as the safe-haven leg
+                   (00679B 元大美債20年 by default) are TPEx-listed, so
+                   they're absent from every TWSE table; TPEx's own
+                   afterTrading/tradingStock endpoint returns one month of
+                   daily closes per request, no key needed.
 """
 
 from __future__ import annotations
@@ -97,12 +117,19 @@ ENDPOINTS = {
     "index_price_classic": f"{TWSE_CLASSIC_BASE}/TAIEX/MI_5MINS_HIST",
     # 集中市場融資融券餘額 (個股別, 當日快照; 加總得大盤融資餘額)
     "margin_balance": f"{TWSE_BASE}/exchangeReport/MI_MARGN",
+    # 融資融券彙總 (舊版網站, 接受 date=YYYYMMDD, 個股別, 回應自帶日期)
+    "margin_balance_classic": f"{TWSE_CLASSIC_BASE}/marginTrading/MI_MARGN",
     # 三大法人買賣金額統計表 (舊版網站, 當日快照, 已依身份別分行, NT$)
     "foreign_cash": f"{TWSE_CLASSIC_BASE}/fund/BFI82U",
     # 每日收盤行情 (舊版網站, 接受 date=YYYYMMDD, 單日全市場所有證券一次回傳)
     "market_index": f"{TWSE_CLASSIC_BASE}/afterTrading/MI_INDEX",
-    # 臺指選擇權 Put/Call 比 (官方計算, 近 ~1 個月)
+    # 臺指選擇權 Put/Call 比 (官方計算, 近 ~1 個月; 2026-11 觀察到停在一個月前未更新)
     "put_call_ratio": f"{TAIFEX_BASE}/PutCallRatio",
+    # 臺指選擇權 Put/Call 比 歷史下載 (舊版網站, GET queryStartDate/queryEndDate=YYYY/MM/DD,
+    # 單次區間最多 30 天, 超過回 HTML 頁而非 CSV; 回應為 MS950 編碼 CSV, 當日盤後即有)
+    "put_call_ratio_download": "https://www.taifex.com.tw/cht/3/pcRatioDown",
+    # 櫃買中心 個股日成交資訊 (code=證券代號, date=YYYY/MM/DD, 回傳該月整月; 上櫃債券 ETF 在此)
+    "tpex_stock_month": "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
     # 三大法人-區分各期貨契約-依日期 (當日快照; 篩「臺股期貨」x「外資及陸資」)
     "institutional_futures": f"{TAIFEX_BASE}/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate",
     # 臺指選擇權波動率指數逐日檔案 (舊版網站, 每個交易日一支檔案, 含收盤前1分鐘均值)
@@ -113,6 +140,10 @@ ENDPOINTS = {
 }
 
 DEFAULT_TIMEOUT = 15
+# Safe-haven bond leg: 元大美債20年 (Yuanta 20+ Year US Treasury Bond ETF),
+# TPEx-listed. Same default as data_sources_finmind.DEFAULT_BOND_ETF so the
+# two sources produce one continuous series.
+DEFAULT_BOND_ETF_CODE = "00679B"
 # Some TWSE endpoints (observed on the classic www.twse.com.tw/rwd family)
 # behave differently or reject requests carrying the default python-requests
 # User-Agent; a browser-like one avoids that without doing anything else.
@@ -212,6 +243,109 @@ def _put_call_from_ratio(raw: list[dict]) -> pd.DataFrame:
     df["put_volume"] = _num(df["PutVolume"])
     df["call_volume"] = _num(df["CallVolume"])
     return df.set_index("date")[["put_volume", "call_volume"]].sort_index()
+
+
+def _put_call_from_taifex_csv(raw_bytes: bytes) -> pd.DataFrame:
+    """pcRatioDown CSV body (MS950) -> put_volume, call_volume, indexed by
+    date. Header row is `日期,賣權成交量,買權成交量,買賣權成交量比率%,...`
+    and each data row ends with a trailing comma. TAIFEX answers a bad
+    request (range over 30 days, malformed date) with an HTML page and a
+    200 status rather than an error, so anything whose first line isn't
+    that header comes back as an empty frame instead of a parse error.
+    """
+    empty = pd.DataFrame(columns=["put_volume", "call_volume"]).rename_axis("date")
+    text = raw_bytes.decode("ms950", errors="replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].startswith("日期"):
+        return empty
+    header = [h.strip() for h in lines[0].split(",")]
+    try:
+        date_i = header.index("日期")
+        put_i = header.index("賣權成交量")
+        call_i = header.index("買權成交量")
+    except ValueError:
+        return empty
+    rows = []
+    for line in lines[1:]:
+        cells = [c.strip() for c in line.split(",")]
+        if len(cells) <= max(date_i, put_i, call_i):
+            continue
+        rows.append((cells[date_i], cells[put_i], cells[call_i]))
+    if not rows:
+        return empty
+    df = pd.DataFrame(rows, columns=["date", "put_volume", "call_volume"])
+    df["date"] = pd.to_datetime(df["date"], format="%Y/%m/%d", errors="coerce")
+    df = df.dropna(subset=["date"])
+    df["put_volume"] = _num(df["put_volume"])
+    df["call_volume"] = _num(df["call_volume"])
+    return df.set_index("date")[["put_volume", "call_volume"]].sort_index()
+
+
+def _margin_balance_from_classic(payload: dict) -> pd.DataFrame:
+    """Classic marginTrading/MI_MARGN payload (`{"stat", "date", "tables":
+    [...]}`) -> one market-wide 融資今日餘額 total (board lots) for the
+    payload's own date, summed over ordinary common stocks only -- same
+    `COMMON_STOCK_CODE` filter and units as `_margin_balance_from_stockwise`
+    so the two sources form one continuous series. The per-stock table is
+    found by its field names (代號 + 今日餘額), not position; its fields
+    repeat 今日餘額 for the 融資 and 融券 groups, and the 融資 one comes
+    first. A non-trading date comes back as `{"stat": "很抱歉，沒有符合條件
+    的資料"}` with no tables -> empty frame. Columns: margin_balance.
+    """
+    empty = pd.DataFrame(columns=["margin_balance"]).rename_axis("date")
+    if not isinstance(payload, dict) or payload.get("stat") != "OK":
+        return empty
+    target = next(
+        (
+            t for t in (payload.get("tables") or [])
+            if "代號" in (t.get("fields") or []) and "今日餘額" in (t.get("fields") or [])
+        ),
+        None,
+    )
+    if target is None or not target.get("data"):
+        return empty
+    fields = target["fields"]
+    code_i = fields.index("代號")
+    balance_i = fields.index("今日餘額")  # first occurrence = 融資 group
+    balances = [
+        r[balance_i] for r in target["data"]
+        if len(r) > balance_i and COMMON_STOCK_CODE.fullmatch(str(r[code_i]).strip())
+    ]
+    if not balances:
+        return empty
+    total = _num(pd.Series(balances)).sum(skipna=True)
+    as_of = pd.to_datetime(str(payload["date"]), format="%Y%m%d")
+    return pd.DataFrame({"margin_balance": [total]}, index=pd.DatetimeIndex([as_of], name="date"))
+
+
+def _bond_close_from_tpex_month(payload: dict) -> pd.DataFrame:
+    """TPEx afterTrading/tradingStock payload (one security, one calendar
+    month) -> daily close, indexed by date. Fields are `['日 期', '成交張數',
+    '成交仟元', '開盤', '最高', '最低', '收盤', '漲跌', '筆數']` -- note the
+    space inside '日 期' -- with ROC slash dates ("115/11/05"). A month
+    with no trading yet (or an unknown code) has an empty `data` list ->
+    empty frame. Columns: close.
+    """
+    empty = pd.DataFrame(columns=["close"]).rename_axis("date")
+    target = None
+    for t in payload.get("tables") or []:
+        normalized = [str(f).replace(" ", "") for f in (t.get("fields") or [])]
+        if "日期" in normalized and "收盤" in normalized:
+            target = (t, normalized)
+            break
+    if target is None or not target[0].get("data"):
+        return empty
+    table, normalized = target
+    date_i = normalized.index("日期")
+    close_i = normalized.index("收盤")
+    rows = [(r[date_i], r[close_i]) for r in table["data"] if len(r) > max(date_i, close_i)]
+    if not rows:
+        return empty
+    df = pd.DataFrame(rows, columns=["date", "close"])
+    df["date"] = _parse_roc_slash_date(df["date"].astype(str).str.strip())
+    df["close"] = _num(df["close"])
+    df = df.dropna(subset=["close"])
+    return df.set_index("date")[["close"]].sort_index()
 
 
 def _margin_balance_from_stockwise(raw: list[dict], as_of: pd.Timestamp) -> pd.DataFrame:
@@ -589,6 +723,42 @@ def fetch_options() -> pd.DataFrame:
     return _put_call_from_ratio(_get_json(ENDPOINTS["put_call_ratio"]))
 
 
+def fetch_put_call_ratio_history_taifex(
+    start: str,
+    end: str | None = None,
+    max_span_days: int = 30,
+) -> pd.DataFrame:
+    """Real TXO put/call volume over an arbitrary date range, no API key,
+    via the classic pcRatioDown CSV download -- the same numbers the
+    openapi `PutCallRatio` snapshot carries, but queryable by date and
+    (unlike that snapshot, seen frozen a month stale) available the
+    evening of the trading day itself. TAIFEX caps one request at 30
+    calendar days and answers anything longer with an HTML page, so the
+    range is walked in `max_span_days` slices (~37 requests for 3 years).
+    Columns: put_volume, call_volume.
+    """
+    start_ts = pd.Timestamp(start).normalize()
+    end_ts = (pd.Timestamp(end) if end else pd.Timestamp.now()).normalize()
+    frames = []
+    cursor = start_ts
+    while cursor <= end_ts:
+        slice_end = min(cursor + pd.Timedelta(days=max_span_days - 1), end_ts)
+        raw = _get_bytes(
+            ENDPOINTS["put_call_ratio_download"],
+            params={
+                "queryStartDate": cursor.strftime("%Y/%m/%d"),
+                "queryEndDate": slice_end.strftime("%Y/%m/%d"),
+            },
+        )
+        frames.append(_put_call_from_taifex_csv(raw))
+        cursor = slice_end + pd.Timedelta(days=1)
+    if not frames:
+        return pd.DataFrame(columns=["put_volume", "call_volume"]).rename_axis("date")
+    result = pd.concat(frames).sort_index()
+    result = result[~result.index.duplicated(keep="last")]
+    return result.loc[start:end] if end else result.loc[start:]
+
+
 def fetch_taifex_vix_close(date: pd.Timestamp | str | None = None) -> pd.DataFrame:
     """One real, official TAIEX-option VIX reading -- see
     `_vix_close_from_taifex_file` for what it actually is (the last-minute
@@ -670,21 +840,67 @@ def _last_probable_trading_day(now: pd.Timestamp | None = None) -> pd.Timestamp:
 
 
 def fetch_margin() -> pd.DataFrame:
-    """融資餘額, summed market-wide across all listed stocks, most recent
-    weekday only (see `_last_probable_trading_day` -- a market holiday
-    that falls on a weekday isn't detected, so its row would repeat the
-    prior real session under a wrong date label). Columns: margin_balance
-    (board lots, not NT$).
+    """融資餘額, summed market-wide across all listed stocks, from the
+    undated openapi snapshot, labelled with the most recent weekday (see
+    `_last_probable_trading_day`). Caution: that snapshot was observed one
+    session behind even late in the evening (Nov 2026), so the label can
+    be a day ahead of the data -- `fetch_margin_history(dates=[day])`
+    reads a payload that states its own date and is the safer "today"
+    fetch. Columns: margin_balance (board lots, not NT$).
     """
     as_of = _last_probable_trading_day()
     return _margin_balance_from_stockwise(_get_json(ENDPOINTS["margin_balance"]), as_of)
 
 
+def fetch_margin_history(
+    start: str | None = None,
+    end: str | None = None,
+    chunk_size: int = 20,
+    cooldown_seconds: float = 45.0,
+    dates: list | pd.DatetimeIndex | None = None,
+) -> pd.DataFrame:
+    """Real market-wide 融資餘額 history, one classic MI_MARGN request per
+    trading day (date=YYYYMMDD, selectType=ALL), summed over common
+    stocks by `_margin_balance_from_classic` -- the same universe and
+    units (board lots) as the daily openapi snapshot, so backfilled days
+    slot straight into raw_margin.csv. Pass `dates` to fetch exactly those
+    days (e.g. only the ones missing locally) instead of every weekday
+    in [start, end]. Same chunk/cooldown pacing and retry-once-then-skip
+    behaviour as `fetch_foreign_cash_history` (same www.twse.com.tw/rwd
+    host); non-trading days come back empty and are skipped. Columns:
+    margin_balance.
+    """
+    if dates is None:
+        dates = pd.bdate_range(start, end or pd.Timestamp.now())
+    frames = []
+    for i, d in enumerate(pd.DatetimeIndex(dates)):
+        if i > 0 and i % chunk_size == 0:
+            time.sleep(cooldown_seconds)
+        params = {"date": d.strftime("%Y%m%d"), "selectType": "ALL", "response": "json"}
+        try:
+            payload = _get_json(ENDPOINTS["margin_balance_classic"], params=params)
+        except (requests.RequestException, ValueError):
+            time.sleep(cooldown_seconds)
+            try:
+                payload = _get_json(ENDPOINTS["margin_balance_classic"], params=params)
+            except (requests.RequestException, ValueError):
+                continue
+        frame = _margin_balance_from_classic(payload)
+        if not frame.empty:
+            frames.append(frame)
+        time.sleep(0.2)
+    if not frames:
+        return pd.DataFrame(columns=["margin_balance"]).rename_axis("date")
+    result = pd.concat(frames).sort_index()
+    return result[~result.index.duplicated(keep="last")]
+
+
 def fetch_foreign_cash_history(
-    start: str,
+    start: str | None = None,
     end: str | None = None,
     chunk_size: int = 40,
     cooldown_seconds: float = 45.0,
+    dates: list | pd.DatetimeIndex | None = None,
 ) -> pd.DataFrame:
     """Real 外資及陸資 net buy/sell (NT$), one BFI82U request per calendar
     day -- unlike the TAIEX/VIX series, there is no month-batch file for
@@ -706,11 +922,14 @@ def fetch_foreign_cash_history(
     version of this function did.
 
     Non-trading weekdays come back empty from `_foreign_cash_from_bfi82u`
-    and are silently skipped, same as always. Columns: net_buy_sell.
+    and are silently skipped, same as always. Pass `dates` to fetch exactly
+    those days instead of every weekday in [start, end] (a gap-filling
+    backfill only wants the days it lacks). Columns: net_buy_sell.
     """
-    dates = pd.bdate_range(start, end or pd.Timestamp.now())
+    if dates is None:
+        dates = pd.bdate_range(start, end or pd.Timestamp.now())
     frames = []
-    for i, d in enumerate(dates):
+    for i, d in enumerate(pd.DatetimeIndex(dates)):
         if i > 0 and i % chunk_size == 0:
             time.sleep(cooldown_seconds)
         params = {"dayDate": d.strftime("%Y%m%d"), "type": "day", "response": "json"}
@@ -790,25 +1009,54 @@ def fetch_foreign(start: str | None = None) -> pd.DataFrame:
     return cash.join(futures_oi["futures_net_oi"], how="outer")
 
 
-def fetch_bond_index() -> pd.DataFrame:
-    """Bond / money-market proxy for the safe-haven-demand indicator.
-
-    TWSE OpenAPI doesn't publish a ready-made bond index; use a local bond
-    ETF/fund NAV series (e.g. a Taiwan government bond ETF) as the proxy
-    and adapt this function to your chosen data source.
+def fetch_bond_index_tpex(
+    start: str,
+    end: str | None = None,
+    code: str = DEFAULT_BOND_ETF_CODE,
+) -> pd.DataFrame:
+    """Daily close of a TPEx-listed bond ETF (default 00679B 元大美債20年) as
+    the safe-haven indicator's bond leg, from TPEx's own per-security
+    monthly table -- one request per calendar month, no key. Produces the
+    same `close` series as data_sources_finmind.fetch_bond_index for the
+    same code, so either source can fill the other's gaps. Columns: close.
     """
-    raise NotImplementedError(
-        "Supply a bond/money-market index/ETF NAV series as the safe-haven proxy."
-    )
+    start_ts = pd.Timestamp(start).replace(day=1)
+    end_ts = pd.Timestamp(end) if end else pd.Timestamp.now()
+    months = pd.date_range(start_ts, end_ts, freq="MS")
+    if months.empty or months[0] != start_ts:
+        months = months.insert(0, start_ts)
+
+    frames = []
+    for month_start in months:
+        payload = _get_json(
+            ENDPOINTS["tpex_stock_month"],
+            params={"code": code, "date": month_start.strftime("%Y/%m/%d"), "response": "json"},
+        )
+        frames.append(_bond_close_from_tpex_month(payload if isinstance(payload, dict) else {}))
+
+    if not frames:
+        return pd.DataFrame(columns=["close"]).rename_axis("date")
+    result = pd.concat(frames).sort_index()
+    result = result[~result.index.duplicated(keep="last")]
+    return result.loc[start:end] if end else result.loc[start:]
+
+
+def fetch_bond_index(start: str | None = None) -> pd.DataFrame:
+    """Bond proxy for the safe-haven-demand indicator: 00679B daily close
+    via `fetch_bond_index_tpex`. Without `start`, roughly the last six
+    weeks (two monthly requests) -- enough for the indicator's 20-day
+    window. Columns: close.
+    """
+    start = start or (pd.Timestamp.now() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    return fetch_bond_index_tpex(start)
 
 
 def fetch_all_raw_data(start: str | None = None) -> dict[str, pd.DataFrame]:
     """Fetch everything indicators.compute_all_raw_indicators can use from
-    this free API. bond_index still has no free implementation and is
-    silently omitted rather than raising -- compute_all_raw_indicators
-    already tolerates missing keys and renormalizes weights over
-    whatever's present, so add it to `raw` yourself once you have a
-    source (e.g. a bond ETF NAV series).
+    these free APIs, bond_index included (TPEx, see `fetch_bond_index`).
+    compute_all_raw_indicators tolerates missing keys and renormalizes
+    weights over whatever's present, so a source that fails is better
+    dropped from `raw` than left as an empty frame.
 
     `start`, if given:
       - switches index_price (and so vix, which is derived from it) from
@@ -823,7 +1071,7 @@ def fetch_all_raw_data(start: str | None = None) -> dict[str, pd.DataFrame]:
         (again one request per trading day, several minutes).
     Without `start`, new_high_low and breadth are omitted (they have no
     meaningful "just today" reading -- new_high_low needs trailing
-    history by definition), same as bond_index. margin and options'
+    history by definition). margin and options'
     windows (today / ~1 month) don't change with or without `start`;
     see the module docstring for why.
     """
@@ -841,10 +1089,9 @@ def fetch_all_raw_data(start: str | None = None) -> dict[str, pd.DataFrame]:
             raw["breadth"] = breadth
         if not new_high_low.empty:
             raw["new_high_low"] = new_high_low
-    try:
-        raw["bond_index"] = fetch_bond_index()
-    except NotImplementedError:
-        pass
+    bond_index = fetch_bond_index(start=start)
+    if not bond_index.empty:
+        raw["bond_index"] = bond_index
     if start:
         raw = {k: v.loc[start:] for k, v in raw.items()}
     return raw

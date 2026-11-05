@@ -343,7 +343,7 @@ def test_fetch_foreign_with_start_backfills_cash_and_defaults_futures_to_zero(mo
     assert result.loc[pd.Timestamp("2026-08-12"), "net_buy_sell"] == 300.0
 
 
-def test_fetch_all_raw_data_omits_unimplemented_sources(monkeypatch):
+def test_fetch_all_raw_data_omits_history_only_sources_without_start(monkeypatch):
     idx = pd.DataFrame({"close": [100.0, 101.0]}, index=pd.bdate_range("2026-08-01", periods=2))
     monkeypatch.setattr(ds, "fetch_index_price", lambda: idx)
     monkeypatch.setattr(ds, "fetch_options", lambda: pd.DataFrame(
@@ -352,10 +352,216 @@ def test_fetch_all_raw_data_omits_unimplemented_sources(monkeypatch):
         {"margin_balance": [5.0]}, index=[idx.index[-1]]))
     monkeypatch.setattr(ds, "fetch_foreign", lambda: pd.DataFrame(
         {"net_buy_sell": [0.0], "futures_net_oi": [10.0]}, index=[idx.index[-1]]))
+    monkeypatch.setattr(ds, "fetch_bond_index", lambda start=None: pd.DataFrame(
+        {"close": [26.0, 26.5]}, index=idx.index))
 
     raw = ds.fetch_all_raw_data()
 
-    assert set(raw) == {"index_price", "options", "vix", "margin", "foreign"}
+    # bond_index is a real (TPEx) source now; only the two that need a
+    # trailing per-day history are absent without `start`
+    assert set(raw) == {"index_price", "options", "vix", "margin", "foreign", "bond_index"}
     assert "new_high_low" not in raw
     assert "breadth" not in raw
-    assert "bond_index" not in raw
+
+
+def test_fetch_all_raw_data_drops_an_empty_bond_index(monkeypatch):
+    idx = pd.DataFrame({"close": [100.0, 101.0]}, index=pd.bdate_range("2026-08-01", periods=2))
+    monkeypatch.setattr(ds, "fetch_index_price", lambda: idx)
+    monkeypatch.setattr(ds, "fetch_options", lambda: pd.DataFrame(
+        {"put_volume": [1.0, 2.0], "call_volume": [1.0, 2.0]}, index=idx.index))
+    monkeypatch.setattr(ds, "fetch_margin", lambda: pd.DataFrame(
+        {"margin_balance": [5.0]}, index=[idx.index[-1]]))
+    monkeypatch.setattr(ds, "fetch_foreign", lambda: pd.DataFrame(
+        {"net_buy_sell": [0.0], "futures_net_oi": [10.0]}, index=[idx.index[-1]]))
+    monkeypatch.setattr(ds, "fetch_bond_index", lambda start=None: pd.DataFrame(columns=["close"]))
+
+    assert "bond_index" not in ds.fetch_all_raw_data()
+
+
+# ---------------------------------------------------------------------------
+# Keyless fallbacks / backfill sources: TAIFEX pcRatioDown CSV, classic
+# MI_MARGN history, TPEx bond-ETF monthly table.
+# ---------------------------------------------------------------------------
+
+PC_RATIO_HEADER = "日期,賣權成交量,買權成交量,買賣權成交量比率%,賣權未平倉量,買權未平倉量,買賣權未平倉量比率%"
+
+
+def _pc_ratio_csv(rows):
+    body = PC_RATIO_HEADER + "\r\n" + "".join(
+        f"{d},{put},{call},{put / call * 100:.2f},1,1,100.00,\r\n" for d, put, call in rows
+    )
+    return body.encode("ms950")
+
+
+def test_put_call_from_taifex_csv_parses_ms950_rows():
+    raw = _pc_ratio_csv([("2026/11/05", 248411, 342039), ("2026/11/04", 435537, 512374)])
+    result = ds._put_call_from_taifex_csv(raw)
+    assert list(result.columns) == ["put_volume", "call_volume"]
+    assert result.loc[pd.Timestamp("2026-11-05"), "put_volume"] == 248411
+    assert result.loc[pd.Timestamp("2026-11-05"), "call_volume"] == 342039
+    assert result.loc[pd.Timestamp("2026-11-04"), "put_volume"] == 435537
+    assert result.index.is_monotonic_increasing
+
+
+def test_put_call_from_taifex_csv_html_error_page_is_empty():
+    # a range over 30 days (or any bad request) gets a 200 with an HTML page
+    html = b'<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN"><html><body>error</body></html>'
+    result = ds._put_call_from_taifex_csv(html)
+    assert result.empty
+    assert list(result.columns) == ["put_volume", "call_volume"]
+
+
+def _margin_classic_payload(date="20261104", rows=None):
+    per_stock_fields = [
+        "代號", "名稱", "買進", "賣出", "現金償還", "前日餘額", "今日餘額", "次一營業日限額",
+        "買進", "賣出", "現券償還", "前日餘額", "今日餘額", "次一營業日限額", "資券互抵", "註記",
+    ]
+    return {
+        "stat": "OK",
+        "date": date,
+        "tables": [
+            {
+                "title": "信用交易統計",
+                "fields": ["項目", "買進", "賣出", "現金(券)償還", "前日餘額", "今日餘額"],
+                "data": [["融資(交易單位)", "446,302", "404,510", "9,713", "9,482,836", "9,514,915"]],
+            },
+            {"title": "融資融券彙總 (全部)", "fields": per_stock_fields, "data": rows or []},
+        ],
+    }
+
+
+def test_margin_balance_from_classic_sums_common_stocks_and_reads_date():
+    rows = [
+        # actively-managed ETF: excluded by code shape, same as the openapi parser
+        ["00400A", "某主動式ETF", "1,962", "465", "61", "14,771", "16,207", "567,785",
+         "0", "0", "0", "0", "5", "567,785", "0", " "],
+        # 融資今日餘額 = 35,144 (7th field); the later 今日餘額 (16) is 融券 and must be ignored
+        ["2330", "台積電", "1,567", "757", "12", "34,346", "35,144", "6,483,092",
+         "101", "6", "0", "111", "16", "6,483,092", "6", " "],
+        ["2317", "鴻海", "1", "1", "0", "1,900", "2,000", "99",
+         "0", "0", "0", "0", "7", "99", "0", " "],
+    ]
+    result = ds._margin_balance_from_classic(_margin_classic_payload(rows=rows))
+    assert list(result.columns) == ["margin_balance"]
+    assert list(result.index) == [pd.Timestamp("2026-11-04")]
+    assert result["margin_balance"].iloc[0] == 35144 + 2000
+
+
+def test_margin_balance_from_classic_no_data_day_is_empty():
+    result = ds._margin_balance_from_classic({"stat": "很抱歉，沒有符合條件的資料"})
+    assert result.empty
+    assert list(result.columns) == ["margin_balance"]
+
+
+def _tpex_month_payload(rows):
+    return {
+        "stat": "ok",
+        "tables": [{
+            "title": "個股日成交資訊",
+            # note the space in '日 期', exactly as TPEx serves it
+            "fields": ["日 期", "成交張數", "成交仟元", "開盤", "最高", "最低", "收盤", "漲跌", "筆數"],
+            "data": rows,
+        }],
+    }
+
+
+def test_bond_close_from_tpex_month_parses_roc_dates_and_close():
+    payload = _tpex_month_payload([
+        ["115/11/04", "48,217", "1,283,292", "26.49", "26.70", "26.46", "26.48", "-0.06", "8,193"],
+        ["115/11/05", "53,460", "1,438,940", "26.76", "27.00", "26.76", "26.99", "0.51", "11,363"],
+    ])
+    result = ds._bond_close_from_tpex_month(payload)
+    assert list(result.columns) == ["close"]
+    assert result.loc[pd.Timestamp("2026-11-05"), "close"] == 26.99
+    assert result.loc[pd.Timestamp("2026-11-04"), "close"] == 26.48
+    assert result.index.is_monotonic_increasing
+
+
+def test_bond_close_from_tpex_month_empty_month():
+    result = ds._bond_close_from_tpex_month(_tpex_month_payload([]))
+    assert result.empty
+    assert list(result.columns) == ["close"]
+
+
+def test_fetch_put_call_ratio_history_taifex_slices_range_into_30_day_windows(monkeypatch):
+    calls = []
+
+    def fake_get_bytes(url, params=None):
+        calls.append((params["queryStartDate"], params["queryEndDate"]))
+        # one row dated at the slice start so the stitched result is checkable
+        return _pc_ratio_csv([(params["queryStartDate"], 10, 20)])
+
+    monkeypatch.setattr(ds, "_get_bytes", fake_get_bytes)
+
+    result = ds.fetch_put_call_ratio_history_taifex("2026-09-01", "2026-11-05")
+
+    assert calls == [
+        ("2026/09/01", "2026/09/30"),
+        ("2026/10/01", "2026/10/30"),
+        ("2026/10/31", "2026/11/05"),
+    ]
+    assert list(result.index) == [
+        pd.Timestamp("2026-09-01"), pd.Timestamp("2026-10-01"), pd.Timestamp("2026-10-31"),
+    ]
+    assert list(result.columns) == ["put_volume", "call_volume"]
+
+
+def test_fetch_margin_history_uses_explicit_dates_and_skips_no_data_days(monkeypatch):
+    monkeypatch.setattr(ds.time, "sleep", lambda s: None)
+    seen = []
+
+    def fake_get_json(url, params=None):
+        seen.append(params["date"])
+        if params["date"] == "20261101":  # a Saturday
+            return {"stat": "很抱歉，沒有符合條件的資料"}
+        rows = [["2330", "台積電", "0", "0", "0", "0", "35,144", "0",
+                 "0", "0", "0", "0", "16", "0", "0", " "]]
+        return _margin_classic_payload(date=params["date"], rows=rows)
+
+    monkeypatch.setattr(ds, "_get_json", fake_get_json)
+
+    result = ds.fetch_margin_history(dates=[pd.Timestamp("2026-11-01"), pd.Timestamp("2026-11-04")])
+
+    assert seen == ["20261101", "20261104"]
+    assert list(result.index) == [pd.Timestamp("2026-11-04")]
+    assert result.loc[pd.Timestamp("2026-11-04"), "margin_balance"] == 35144
+
+
+def test_fetch_foreign_cash_history_accepts_explicit_dates(monkeypatch):
+    monkeypatch.setattr(ds.time, "sleep", lambda s: None)
+    seen = []
+
+    def fake_get_json(url, params=None):
+        seen.append(params["dayDate"])
+        return {
+            "date": params["dayDate"],
+            "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+            "data": [["外資及陸資(不含外資自營商)", "1", "1", "7"]],
+        }
+
+    monkeypatch.setattr(ds, "_get_json", fake_get_json)
+
+    result = ds.fetch_foreign_cash_history(dates=[pd.Timestamp("2026-10-28"), pd.Timestamp("2026-11-04")])
+
+    assert seen == ["20261028", "20261104"]
+    assert list(result.index) == [pd.Timestamp("2026-10-28"), pd.Timestamp("2026-11-04")]
+
+
+def test_fetch_bond_index_tpex_one_request_per_month_trimmed_to_range(monkeypatch):
+    calls = []
+
+    def fake_get_json(url, params=None):
+        calls.append(params["date"])
+        assert params["code"] == "00679B"
+        y, m, _ = params["date"].split("/")
+        roc = f"{int(y) - 1911}/{m}/05"
+        return _tpex_month_payload([[roc, "1", "1", "26", "26", "26", "26.50", "0", "1"]])
+
+    monkeypatch.setattr(ds, "_get_json", fake_get_json)
+
+    result = ds.fetch_bond_index_tpex("2026-09-10", "2026-11-05")
+
+    assert calls == ["2026/09/01", "2026/10/01", "2026/11/01"]
+    # the Sep 5 row predates --start and is trimmed, same as fetch_index_price_history
+    assert list(result.index) == [pd.Timestamp("2026-10-05"), pd.Timestamp("2026-11-05")]
+    assert list(result.columns) == ["close"]
