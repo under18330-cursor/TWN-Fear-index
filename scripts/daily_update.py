@@ -24,8 +24,17 @@ All state lives under data/ (gitignored, local-only, not committed):
 
 FinMind token: read from the FINMIND_API_TOKEN env var, falling back to
 data/.finmind_token (a local, gitignored plaintext file) if unset. Used
-for options (put/call) and bond_index; without it options falls back to
-TAIFEX's own ratio endpoint and bond_index is skipped for the day.
+first for options (put/call) and bond_index. Both legs have keyless
+fallbacks that kick in when the token is missing or rejected, or when
+FinMind simply doesn't have the target day yet: options -> TAIFEX's own
+pcRatioDown CSV download (then the openapi ratio snapshot as a last
+resort), bond_index -> TPEx's per-security monthly table. Neither leg
+goes NaN just because the token died -- that happened silently for seven
+weeks in Sep-Nov 2026 before the fallbacks existed.
+
+Gaps: this script only ever scores "the latest weekday". A day it never
+ran for (or ran too early for) stays missing -- use
+scripts/backfill_ledger.py to fill or recompute a date range.
 
 Endpoint choices matter for same-day freshness: openapi.twse.com.tw's
 snapshot feeds (index_price_hist, TAIFEX's put/call ratio) were observed
@@ -33,10 +42,14 @@ still one session behind at ~18:00 local, while the classic
 www.twse.com.tw/rwd monthly TAIEX file and FinMind's options dataset
 already carried the day -- so those are what the append path uses.
 
-Caveat carried over from data_sources.py: the TWSE margin-balance
-snapshot has no date field in its payload, so if TWSE hasn't refreshed
-it yet when this runs, that day's row silently gets the prior session's
-number under today's date rather than a detectable gap.
+Margin comes from the classic, dated MI_MARGN endpoint (date=target),
+not the openapi snapshot: that snapshot carries no date and was found to
+still show the PRIOR session's total late into the evening (every
+daily-run day Sep-Nov 2026 had repeated the previous day's balance), so
+using it meant silently scoring yesterday's margin under today's date.
+If the dated endpoint hasn't published the target day yet, margin is
+left out of that day's row (weights renormalize) and the gap is
+reported, rather than filled with a stale number.
 """
 
 from __future__ import annotations
@@ -75,6 +88,42 @@ SCORE_COLS = {
     "margin": "margin_score",
     "foreign": "foreign_score",
 }
+
+
+def _describe(exc: Exception, token: str | None) -> str:
+    """One-line error text safe to print: requests' HTTPError repr embeds
+    the full URL, token query-string and all, so blank it out first.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    return text.replace(token, "***") if token else text
+
+
+def _rnd(v, nd=1):
+    return None if pd.isna(v) else round(float(v), nd)
+
+
+def ledger_entry(result: pd.DataFrame, day: pd.Timestamp) -> dict:
+    """One ledger_history.json row for `day` out of TWNFearGreedIndex's
+    result frame (joined with taiex_close). Shared with backfill_ledger.py
+    so both scripts write byte-identical rows for the same inputs.
+    """
+    row = result.loc[day]
+    entry = {"date": day.strftime("%Y-%m-%d"), "taiex": _rnd(row.get("taiex_close"), 0)}
+    for short, col in SCORE_COLS.items():
+        entry[short] = _rnd(row[col]) if col in result.columns else None
+    entry["composite"] = _rnd(row["composite"])
+    entry["label"] = row["label"]
+    return entry
+
+
+def fetch_snapshot(day: pd.Timestamp) -> pd.DataFrame:
+    """Per-stock MI_INDEX closing snapshot for one trading day (empty on a
+    holiday or before TWSE has published it)."""
+    payload = ds._get_json(
+        ds.ENDPOINTS["market_index"],
+        params={"date": day.strftime("%Y%m%d"), "type": "ALLNOTIND", "response": "json"},
+    )
+    return ds._market_snapshot_from_mi_index(payload)
 
 
 def _finmind_token() -> str | None:
@@ -130,8 +179,8 @@ def main() -> int:
     token = _finmind_token()
     if not token:
         print(
-            "WARNING: no FinMind token found (env FINMIND_API_TOKEN or "
-            "data/.finmind_token) -- bond_index (safe-haven) will be skipped for today."
+            "NOTE: no FinMind token found (env FINMIND_API_TOKEN or data/.finmind_token) "
+            "-- options and bond_index will use the keyless TAIFEX / TPEx sources."
         )
 
     print(f"target trading day: {target.date()}")
@@ -144,19 +193,27 @@ def main() -> int:
     vix = ds.fetch_vix(index_price, real_lookback_months=4)
 
     options = _load_csv("options")
+    fresh = pd.DataFrame()
     if token:
         print("options (FinMind put/call, recent window)...")
         try:
-            options = _merge(options, fm.fetch_put_call_ratio_history(recent_start, token=token))
+            fresh = fm.fetch_put_call_ratio_history(recent_start, token=token)
         except Exception as exc:  # noqa: BLE001
-            print(f"  FinMind options failed ({exc}); falling back to TAIFEX ratio endpoint.")
-            options = _merge(options, ds.fetch_options())
-    else:
-        print("options (TAIFEX put/call ratio endpoint)...")
-        options = _merge(options, ds.fetch_options())
+            print(f"  FinMind options failed ({_describe(exc, token)}).")
+    if fresh.empty or target not in fresh.index:
+        print("options (TAIFEX pcRatioDown download, recent window)...")
+        try:
+            fresh = _merge(fresh, ds.fetch_put_call_ratio_history_taifex(recent_start))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  TAIFEX download failed ({_describe(exc, token)}); falling back to the openapi ratio snapshot.")
+            fresh = _merge(fresh, ds.fetch_options())
+    options = _merge(options, fresh)
 
-    print("margin (TWSE openapi snapshot, market-wide)...")
-    margin = _merge(_load_csv("margin"), ds.fetch_margin())
+    print("margin (classic MI_MARGN, dated, market-wide)...")
+    margin_today = ds.fetch_margin_history(dates=[target])
+    if margin_today.empty:
+        print(f"  margin for {target.date()} not published yet -- scoring today without it.")
+    margin = _merge(_load_csv("margin"), margin_today)
 
     print("foreign (BFI82U + TAIFEX futures OI, today)...")
     foreign = _merge(_load_csv("foreign"), ds.fetch_foreign())
@@ -165,24 +222,29 @@ def main() -> int:
     if "futures_net_oi" in foreign.columns:
         foreign["futures_net_oi"] = foreign["futures_net_oi"].fillna(0.0)
 
+    # Fetched over the recent window, not just the target day, so a stretch
+    # of failed runs heals itself the next time either source answers.
     bond_index = _load_csv("bond_index")
+    fresh = pd.DataFrame()
     if token:
-        print("bond_index (FinMind ETF NAV proxy)...")
+        print("bond_index (FinMind 00679B close, recent window)...")
         try:
-            new_bond = fm.fetch_bond_index(start=target.strftime("%Y-%m-%d"), token=token)
-            bond_index = _merge(bond_index, new_bond)
+            fresh = fm.fetch_bond_index(start=recent_start, token=token)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  FinMind bond_index failed ({_describe(exc, token)}).")
+    if fresh.empty or target not in fresh.index:
+        print("bond_index (TPEx 00679B monthly close)...")
+        try:
+            fresh = _merge(fresh, ds.fetch_bond_index_tpex(recent_start))
         except Exception as exc:  # noqa: BLE001 - keep going without this leg
-            print(f"  bond_index fetch failed, keeping prior history only: {exc}")
+            print(f"  TPEx bond_index failed ({_describe(exc, token)}); keeping prior history only.")
+    bond_index = _merge(bond_index, fresh)
 
     print("breadth / new_high_low (MI_INDEX per-stock snapshot, today)...")
     snapshots_path = DATA_DIR / "mi_index_snapshots.pkl"
     snapshots = pickle.loads(snapshots_path.read_bytes()) if snapshots_path.exists() else {}
     if target not in snapshots:
-        payload = ds._get_json(
-            ds.ENDPOINTS["market_index"],
-            params={"date": target.strftime("%Y%m%d"), "type": "ALLNOTIND", "response": "json"},
-        )
-        snap = ds._market_snapshot_from_mi_index(payload)
+        snap = fetch_snapshot(target)
         if not snap.empty:
             snapshots[target] = snap
         else:
@@ -218,14 +280,14 @@ def main() -> int:
 
     row = result.loc[target]
 
-    def rnd(v, nd=1):
-        return None if pd.isna(v) else round(float(v), nd)
+    # No TAIEX close means the market was shut (holiday) or the close isn't
+    # published yet. Either way skip the day entirely: snapshot feeds like
+    # margin carry no date, so they'd otherwise score a stale number here.
+    if pd.isna(row.get("taiex_close")):
+        print(f"no TAIEX close for {target.date()} -- treating as market holiday. Nothing saved.")
+        return 1
 
-    entry = {"date": target.strftime("%Y-%m-%d"), "taiex": rnd(row.get("taiex_close"), 0)}
-    for short, col in SCORE_COLS.items():
-        entry[short] = rnd(row[col]) if col in result.columns else None
-    entry["composite"] = rnd(row["composite"])
-    entry["label"] = row["label"]
+    entry = ledger_entry(result, target)
     ledger.append(entry)
 
     _save_csv("index_price", index_price)
